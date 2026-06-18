@@ -943,7 +943,10 @@ int ggml_metal_op_sum_rows(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    GGML_ASSERT(ggml_is_contiguous_rows(op->src[0]));
+    // Contiguous rows not required: the scalar kernel byte-strides by nb00, so a
+    // transposed src0 is summed directly (eliminates the ggml_cont in the
+    // transpose+cont+sum_rows "sum_cols" pattern). The float4 variant is selected
+    // only for contiguous src0 (see ggml_metal_library_get_pipeline_sum_rows).
 
     ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
     ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
@@ -1355,7 +1358,13 @@ int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    const size_t smem = pipeline.smem;
+    // The barrier-based reduction path stores one partial per thread, so it
+    // needs nth floats of shared memory rather than the one-per-simdgroup the
+    // simd path uses. Inert on the simd path (pipeline.smem already covers it).
+    size_t smem = pipeline.smem;
+    if (ggml_metal_device_get_props(ctx->dev)->reduce_via_shmem) {
+        smem = std::max<size_t>(smem, GGML_PAD(nth*sizeof(float), 16));
+    }
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
@@ -3281,7 +3290,10 @@ int ggml_metal_op_l2_norm(ggml_metal_op_t ctx, int idx) {
 
     nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
-    const size_t smem = pipeline.smem;
+    size_t smem = pipeline.smem;
+    if (ggml_metal_device_get_props(ctx->dev)->reduce_via_shmem) {
+        smem = std::max<size_t>(smem, GGML_PAD(nth*sizeof(float), 16));
+    }
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -3332,7 +3344,10 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
     //nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
     //nth = std::min(nth, ne00/4);
 
-    const size_t smem = pipeline.smem;
+    size_t smem = pipeline.smem;
+    if (ggml_metal_device_get_props(ctx->dev)->reduce_via_shmem) {
+        smem = std::max<size_t>(smem, GGML_PAD(nth*sizeof(float), 16));
+    }
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -3468,7 +3483,10 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
     nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
     nth = std::min(nth, args.ne00_t);
 
-    const size_t smem = pipeline.smem;
+    size_t smem = pipeline.smem;
+    if (ggml_metal_device_get_props(ctx->dev)->reduce_via_shmem) {
+        smem = std::max<size_t>(smem, GGML_PAD(nth*sizeof(float), 16));
+    }
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);

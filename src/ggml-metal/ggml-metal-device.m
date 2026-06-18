@@ -1275,6 +1275,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_TRI:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_SUM_ROWS:
+            // SUM_ROWS handles non-contiguous (transposed) src0 via nb00 byte-strided
+            // access, eliminating the ggml_cont in the transpose+cont+sum_rows
+            // "sum_cols" pattern.
+            return has_simdgroup_reduction;
         case GGML_OP_CUMSUM:
         case GGML_OP_MEAN:
         case GGML_OP_SOFT_MAX:
