@@ -3430,7 +3430,26 @@ static inline void helper_mv_reduce_and_write(
         const int ne01,
         ushort tiisg,
         ushort sgitg,
+        ushort nsg,
         threadgroup char * shmem) {
+    if (FC_reduce_via_shmem) {
+        // Each of the nsg*FC_nw threads holds a partial dot product for `row`; a
+        // full threadgroup reduction yields the row total. r0 is identical for
+        // every simdgroup here (this is the cross-simdgroup reduction path), so
+        // the loop bound is threadgroup-uniform and the reduction barriers are
+        // entered uniformly. buf must hold nsg*FC_nw floats (sized by the host).
+        threadgroup float * buf = (threadgroup float *) shmem;
+        const ushort tid = sgitg*FC_nw + tiisg;
+        const ushort n   = nsg*FC_nw;
+        for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
+            const float tot = helper_tg_reduce_sum(sumf[row], buf, tid, n);
+            if (tid == 0) {
+                dst_f32[r0 + row] = tot;
+            }
+        }
+        return;
+    }
+
     constexpr short NW = N_SIMDWIDTH;
 
     threadgroup float * shmem_f32[NR0];
@@ -3482,7 +3501,7 @@ void mul_vec_q_n_f32_impl(
         ushort sgitg) {
     const short NSG = FC_mul_mv_nsg;
 
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = FC_nw;
     constexpr short NQ = 16;
 
     const int nb = args.ne00/QK4_0;
@@ -3511,46 +3530,77 @@ void mul_vec_q_n_f32_impl(
 
     float sumf[NR0] = {0.f};
 
-    const short ix = (tiisg/(NW/NQ));
-    const short il = (tiisg%(NW/NQ))*8;
-
-    //const int ib0 = sgitg*NQ + ix;
-    const int ib0 = ix;
-
     float yl[16]; // src1 vector cache
 
-    //device const float * yb = y + ix*QK4_0 + il;
-    device const float * yb = y + ib0*QK4_0 + il;
+    // The kernel partitions each QK4_0 block into a fixed 32-position space
+    // (NQ=16 block halves x 2 nibble offsets). flat_pos walks [tiisg, 32) by the
+    // real SIMD width NW. At width 32 (the only validated/shipping config) the
+    // stride is a literal, so the loop collapses to one pass and the inner block
+    // loop unrolls exactly as upstream; the branch is resolved at pipeline-compile
+    // time (FC_nw is a function constant). Other widths use the runtime stride for
+    // full coverage: multiple passes at NW=16/8, idle lanes >= 32 at NW=64.
+    if (NW == 32) {
+        const short il = (tiisg % 2) * 8;
 
-    // each thread in a SIMD group deals with half a block.
-    //for (int ib = ib0; ib < nb; ib += NSG*NQ) {
-    for (int ib = ib0; ib < nb; ib += NQ) {
-        float sumy[2] = { 0.f, 0.f };
+        device const float * yb = y + (tiisg / 2)*QK4_0 + il;
 
-        FOR_UNROLL (short i = 0; i < 8; i += 2) {
-            sumy[0]  += yb[i +  0] + yb[i +  1];
-            yl[i + 0] = yb[i +  0];
-            yl[i + 1] = yb[i +  1]/256.f;
+        for (int ib = tiisg / 2; ib < nb; ib += NQ) {
+            float sumy[2] = { 0.f, 0.f };
 
-            sumy[1]  += yb[i + 16] + yb[i + 17];
-            yl[i + 8] = yb[i + 16]/16.f;
-            yl[i + 9] = yb[i + 17]/4096.f;
+            FOR_UNROLL (short i = 0; i < 8; i += 2) {
+                sumy[0]  += yb[i +  0] + yb[i +  1];
+                yl[i + 0] = yb[i +  0];
+                yl[i + 1] = yb[i +  1]/256.f;
+
+                sumy[1]  += yb[i + 16] + yb[i + 17];
+                yl[i + 8] = yb[i + 16]/16.f;
+                yl[i + 9] = yb[i + 17]/4096.f;
+            }
+
+            FOR_UNROLL (short row = 0; row < NR0; row++) {
+                sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy[0] + sumy[1], yl, il);
+            }
+
+            yb += QK4_0 * NQ;
         }
+    } else {
+        for (short flat_pos = tiisg; flat_pos < 32; flat_pos += NW) {
+            const short ix = flat_pos / 2;
+            const short il = (flat_pos % 2) * 8;
+            const int ib0 = ix;
 
-        FOR_UNROLL (short row = 0; row < NR0; row++) {
-            sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy[0] + sumy[1], yl, il);
+            device const float * yb = y + ib0*QK4_0 + il;
+
+            for (int ib = ib0; ib < nb; ib += NQ) {
+                float sumy[2] = { 0.f, 0.f };
+
+                FOR_UNROLL (short i = 0; i < 8; i += 2) {
+                    sumy[0]  += yb[i +  0] + yb[i +  1];
+                    yl[i + 0] = yb[i +  0];
+                    yl[i + 1] = yb[i +  1]/256.f;
+
+                    sumy[1]  += yb[i + 16] + yb[i + 17];
+                    yl[i + 8] = yb[i + 16]/16.f;
+                    yl[i + 9] = yb[i + 17]/4096.f;
+                }
+
+                FOR_UNROLL (short row = 0; row < NR0; row++) {
+                    sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy[0] + sumy[1], yl, il);
+                }
+
+                yb += QK4_0 * NQ;
+            }
         }
-
-        yb += QK4_0 * 16;
-        //yb += NSG*NQ*QK4_0;
     }
 
     device float * dst_f32 = (device float *) dst + im*args.ne0*args.ne1 + r1*args.ne0;
 
-    //helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    //helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, NSG, shmem);
 
     for (int row = 0; row < NR0; ++row) {
-        const float tot = simd_sum(sumf[row]);
+        const float tot = FC_reduce_via_shmem
+            ? helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw)
+            : simd_sum(sumf[row]);
 
         if (tiisg == 0 && r0 + row < args.ne01) {
             dst_f32[r0 + row] = tot;
@@ -3616,8 +3666,18 @@ void kernel_mul_mv_q1_0_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (int row = 0; row < nr0; ++row) {
-        const float tot = simd_sum(sumf[row]);
+        const float tot = FC_reduce_via_shmem
+            ? helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw)
+            : simd_sum(sumf[row]);
 
         if (tiisg == 0 && first_row + row < args.ne01) {
             dst_f32[first_row + row] = tot;
@@ -3631,10 +3691,11 @@ kernel void kernel_mul_mv_q1_0_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_q1_0_f32_impl<N_R0_Q1_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q1_0_f32_impl<N_R0_Q1_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 kernel void kernel_mul_mv_q4_0_f32(
@@ -3697,7 +3758,7 @@ void kernel_mul_mv_q8_0_f32_impl(
         ushort sgitg) {
     const short NSG = FC_mul_mv_nsg;
 
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = FC_nw;
     constexpr short NQ = 8;
 
     const int nb = args.ne00/QK8_0;
@@ -3725,38 +3786,79 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     float sumf[NR0] = { 0.f };
 
-    const short ix = tiisg/(NW/NQ);
-    const short il = tiisg%(NW/NQ);
-
-    const int ib0 = sgitg*NQ + ix;
-
     float yl[NQ];
 
-    device const float * yb = y + ib0*QK8_0 + il*NQ;
+    // Fixed 32-position decomposition (NQ=8 blocks x 4 quant offsets). flat_pos
+    // walks [tiisg, 32) by the real SIMD width NW. At width 32 (the only validated/
+    // shipping config) the stride is a literal so the loop collapses to one pass
+    // and unrolls as upstream; the branch is resolved at pipeline-compile time
+    // (FC_nw is a function constant). Other widths use the runtime stride for full
+    // coverage: looped at NW=16/8, idle lanes >= 32 at NW=64.
+    if (NW == 32) {
+        const short il  = tiisg % 4;
+        const int   ib0 = sgitg*NQ + tiisg / 4;
 
-    // each thread in a SIMD group deals with NQ quants at a time
-    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
-        for (short i = 0; i < NQ; ++i) {
-            yl[i] = yb[i];
-        }
+        device const float * yb = y + ib0*QK8_0 + il*NQ;
 
-        for (short row = 0; row < NR0; row++) {
-            device const int8_t * qs = ax[row][ib].qs + il*NQ;
-
-            float sumq = 0.f;
-            FOR_UNROLL (short i = 0; i < NQ; ++i) {
-                sumq += qs[i] * yl[i];
+        for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+            for (short i = 0; i < NQ; ++i) {
+                yl[i] = yb[i];
             }
 
-            sumf[row] += sumq*ax[row][ib].d;
-        }
+            for (short row = 0; row < NR0; row++) {
+                device const int8_t * qs = ax[row][ib].qs + il*NQ;
 
-        yb += NSG*NQ*QK8_0;
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    sumq += qs[i] * yl[i];
+                }
+
+                sumf[row] += sumq*ax[row][ib].d;
+            }
+
+            yb += NSG*NQ*QK8_0;
+        }
+    } else {
+        for (short flat_pos = tiisg; flat_pos < 32; flat_pos += NW) {
+            const short ix = flat_pos / 4;
+            const short il = flat_pos % 4;
+            const int ib0 = sgitg*NQ + ix;
+
+            device const float * yb = y + ib0*QK8_0 + il*NQ;
+
+            // each thread in a SIMD group deals with NQ quants at a time
+            for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+                for (short i = 0; i < NQ; ++i) {
+                    yl[i] = yb[i];
+                }
+
+                for (short row = 0; row < NR0; row++) {
+                    device const int8_t * qs = ax[row][ib].qs + il*NQ;
+
+                    float sumq = 0.f;
+                    FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                        sumq += qs[i] * yl[i];
+                    }
+
+                    sumf[row] += sumq*ax[row][ib].d;
+                }
+
+                yb += NSG*NQ*QK8_0;
+            }
+        }
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, NSG, shmem);
 }
 
 [[host_name("kernel_mul_mv_q8_0_f32")]]
@@ -4171,7 +4273,15 @@ void kernel_mul_mv_t_t_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, NSG, shmem);
 }
 
 template<typename T0, typename T1, typename args_t>
@@ -4295,7 +4405,15 @@ void kernel_mul_mv_t_t_4_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, NSG, shmem);
 }
 
 template<typename T0, typename T04, typename T1, typename T14, typename args_t>
@@ -7708,8 +7826,21 @@ void kernel_mul_mv_q2_K_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        float sum_all;
+        if (FC_reduce_via_shmem) {
+            sum_all = helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw);
+        } else {
+            sum_all = simd_sum(sumf[row]);
+        }
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all;
         }
@@ -7722,11 +7853,12 @@ kernel void kernel_mul_mv_q2_K_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_q2_K_f32_impl<N_R0_Q2_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q2_K_f32_impl<N_R0_Q2_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 template<int nr0, typename args_t>
@@ -7763,16 +7895,12 @@ void kernel_mul_mv_q3_K_f32_impl(
     //const uint16_t kmask1 = 0x3030;
     //const uint16_t kmask2 = 0x0f0f;
 
-    const short tid = tiisg/4;
-    const short ix  = tiisg%4;
-    const short ip  = tid/4;          // 0 or 1
-    const short il  = 2*((tid%4)/2);  // 0 or 2
-    const short ir  = tid%2;
-    const short l0  = 8*ir;
+    const short ix       = tiisg % 4;
+    const short tid_base = tiisg / 4;
 
     // One would think that the Metal compiler would figure out that ip and il can only have
     // 4 possible states, and optimize accordingly. Well, no. It needs help, and we do it
-    // with these two tales.
+    // with these two tables.
     //
     // Possible masks for the high bit
     const ushort4 mm[4] = {{0x0001, 0x0100, 0x0002, 0x0200},  // ip = 0, il = 0
@@ -7783,24 +7911,36 @@ void kernel_mul_mv_q3_K_f32_impl(
     // Possible masks for the low 2 bits
     const int4 qm[2] = {{0x0003, 0x0300, 0x000c, 0x0c00}, {0x0030, 0x3000, 0x00c0, 0xc000}};
 
-    const ushort4 hm = mm[2*ip + il/2];
-
-    const short shift = 2*il;
-
-    const float v1 = il == 0 ? 4.f : 64.f;
-    const float v2 = 4.f * v1;
-
-    const uint16_t s_shift1 = 4*ip;
-    const uint16_t s_shift2 = s_shift1 + il;
-
-    const short q_offset = 32*ip + l0;
-    const short y_offset = 128*ip + 32*il + l0;
-
-    device const float * y1 = yy + ix*QK_K + y_offset;
-
     uint32_t scales32, aux32;
     thread uint16_t * scales16 = (thread uint16_t *)&scales32;
     thread const int8_t * scales = (thread const int8_t *)&scales32;
+
+    float sumf[nr0] = {0.f};
+
+    // q3_K spreads each block over 8 tid positions x 4 strides (ix). At NW=32 a
+    // thread owns exactly one tid (== tid_base); at NW<32 it sweeps multiple
+    // (tid += NW/4) to cover all 8; at NW=64 lanes with tid_base >= 8 idle.
+    // No-op at NW=32.
+    for (short tid = tid_base; tid < 8; tid += FC_nw/4) {
+        const short ip  = tid/4;          // 0 or 1
+        const short il  = 2*((tid%4)/2);  // 0 or 2
+        const short ir  = tid%2;
+        const short l0  = 8*ir;
+
+        const ushort4 hm = mm[2*ip + il/2];
+
+        const short shift = 2*il;
+
+        const float v1 = il == 0 ? 4.f : 64.f;
+        const float v2 = 4.f * v1;
+
+        const uint16_t s_shift1 = 4*ip;
+        const uint16_t s_shift2 = s_shift1 + il;
+
+        const short q_offset = 32*ip + l0;
+        const short y_offset = 128*ip + 32*il + l0;
+
+        device const float * y1 = yy + ix*QK_K + y_offset;
 
     float sumf1[nr0] = {0.f};
     float sumf2[nr0] = {0.f};
@@ -7867,16 +8007,30 @@ void kernel_mul_mv_q3_K_f32_impl(
         y1 += 4 * QK_K;
     }
 
-    for (int row = 0; row < nr0; ++row) {
-        const float sumf = (sumf1[row] + 0.25f * sumf2[row]) / (1 << shift);
-        sumf1[row] = simd_sum(sumf);
+        for (int row = 0; row < nr0; ++row) {
+            sumf[row] += (sumf1[row] + 0.25f * sumf2[row]) / (1 << shift);
+        }
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    if (tiisg == 0) {
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-            dst_f32[first_row + row] = sumf1[row];
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        float sum_all;
+        if (FC_reduce_via_shmem) {
+            sum_all = helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw);
+        } else {
+            sum_all = simd_sum(sumf[row]);
+        }
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = sum_all;
         }
     }
 }
@@ -7887,11 +8041,12 @@ kernel void kernel_mul_mv_q3_K_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_q3_K_f32_impl<N_R0_Q3_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q3_K_f32_impl<N_R0_Q3_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 template<int nr0, typename args_t>
@@ -7995,7 +8150,12 @@ void kernel_mul_mv_q4_K_f32_impl(
     device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
 
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        float sum_all;
+        if (FC_reduce_via_shmem) {
+            sum_all = helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw);
+        } else {
+            sum_all = simd_sum(sumf[row]);
+        }
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all;
         }
@@ -8008,11 +8168,12 @@ kernel void kernel_mul_mv_q4_K_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 template<int nr0, typename args_t>
@@ -8125,8 +8286,18 @@ void kernel_mul_mv_q5_K_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        const float tot = simd_sum(sumf[row]);
+        const float tot = FC_reduce_via_shmem
+            ? helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw)
+            : simd_sum(sumf[row]);
         if (tiisg == 0) {
             dst_f32[first_row + row] = tot;
         }
@@ -8139,11 +8310,12 @@ kernel void kernel_mul_mv_q5_K_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_q5_K_f32_impl<N_R0_Q5_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q5_K_f32_impl<N_R0_Q5_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 template<int nr0, typename args_t>
@@ -8233,8 +8405,21 @@ void kernel_mul_mv_q6_K_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        float sum_all;
+        if (FC_reduce_via_shmem) {
+            sum_all = helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw);
+        } else {
+            sum_all = simd_sum(sumf[row]);
+        }
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all;
         }
@@ -8247,11 +8432,12 @@ kernel void kernel_mul_mv_q6_K_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 // ======================= "True" 2-bit
@@ -8293,20 +8479,28 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
     {
-        int nval = 4;
-        int pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2xxs_grid[pos + i];
-        nval = 2;
-        pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        // Strided table load so every entry is covered for any SIMD width: the
+        // single-shot form assumed NW*NSG >= entries (true only at NW=32,NSG=2).
+        const int total_threads = FC_nw * NSG;
+        const int nval = 4;
+        for (int pos = (FC_nw*sgitg + tiisg)*nval; pos < 256; pos += total_threads*nval) {
+            for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2xxs_grid[pos + i];
+        }
+        const int nval2 = 2;
+        for (int pos = (FC_nw*sgitg + tiisg)*nval2; pos < 128; pos += total_threads*nval2) {
+            for (int i = 0; i < nval2; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     const int ix = tiisg;
 
-    device const float * y4 = y + 32 * ix;
+    // Stride by the real SIMD width NW so all nb32 positions are visited (the
+    // literal-32 stride skipped positions NW..31 at NW=16). y4 is re-derived per
+    // ib32 rather than incrementally advanced by the old stride. No-op at NW=32.
+    for (int ib32 = ix; ib32 < nb32; ib32 += FC_nw) {
+        device const float * y4 = y + 32 * ib32;
 
-    for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
         for (short i = 0; i < 32; ++i) {
             yl[i] = y4[i];
         }
@@ -8337,14 +8531,25 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
             dh += args.nb01/2;
             q2 += args.nb01/2;
         }
-
-        y4 += 32 * 32;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        float sum_all;
+        if (FC_reduce_via_shmem) {
+            sum_all = helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw);
+        } else {
+            sum_all = simd_sum(sumf[row]);
+        }
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all * 0.25f;
         }
@@ -8401,12 +8606,15 @@ void kernel_mul_mv_iq2_xs_f32_impl(
     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 512);
     {
-        int nval = 8;
-        int pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2xs_grid[pos + i];
-        nval = 2;
-        pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        const int total_threads = FC_nw * NSG;
+        const int nval = 8;
+        for (int pos = (FC_nw*sgitg + tiisg)*nval; pos < 512; pos += total_threads*nval) {
+            for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2xs_grid[pos + i];
+        }
+        const int nval2 = 2;
+        for (int pos = (FC_nw*sgitg + tiisg)*nval2; pos < 128; pos += total_threads*nval2) {
+            for (int i = 0; i < nval2; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -8461,8 +8669,21 @@ void kernel_mul_mv_iq2_xs_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        float sum_all;
+        if (FC_reduce_via_shmem) {
+            sum_all = helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw);
+        } else {
+            sum_all = simd_sum(sumf[row]);
+        }
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all * 0.25f;
         }
@@ -8520,12 +8741,15 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
     threadgroup uint32_t * svalues = (threadgroup uint32_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
     {
-        int nval = 4;
-        int pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq3xxs_grid[pos + i];
-        nval = 2;
-        pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        const int total_threads = FC_nw * NSG;
+        const int nval = 4;
+        for (int pos = (FC_nw*sgitg + tiisg)*nval; pos < 256; pos += total_threads*nval) {
+            for (int i = 0; i < nval; ++i) svalues[pos + i] = iq3xxs_grid[pos + i];
+        }
+        const int nval2 = 2;
+        for (int pos = (FC_nw*sgitg + tiisg)*nval2; pos < 128; pos += total_threads*nval2) {
+            for (int i = 0; i < nval2; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -8573,8 +8797,21 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        float sum_all;
+        if (FC_reduce_via_shmem) {
+            sum_all = helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw);
+        } else {
+            sum_all = simd_sum(sumf[row]);
+        }
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all * 0.5f;
         }
@@ -8631,9 +8868,11 @@ void kernel_mul_mv_iq3_s_f32_impl(
 
     threadgroup uint32_t * svalues = (threadgroup uint32_t *) shmem;
     {
-        int nval = 8;
-        int pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq3s_grid[pos + i];
+        const int total_threads = FC_nw * NSG;
+        const int nval = 8;
+        for (int pos = (FC_nw*sgitg + tiisg)*nval; pos < 512; pos += total_threads*nval) {
+            for (int i = 0; i < nval; ++i) svalues[pos + i] = iq3s_grid[pos + i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -8685,8 +8924,21 @@ void kernel_mul_mv_iq3_s_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        float sum_all;
+        if (FC_reduce_via_shmem) {
+            sum_all = helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw);
+        } else {
+            sum_all = simd_sum(sumf[row]);
+        }
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all;
         }
@@ -8798,8 +9050,21 @@ void kernel_mul_mv_iq2_s_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        float sum_all;
+        if (FC_reduce_via_shmem) {
+            sum_all = helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw);
+        } else {
+            sum_all = simd_sum(sumf[row]);
+        }
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all * 0.25f;
         }
@@ -8898,8 +9163,21 @@ void kernel_mul_mv_iq1_s_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        float sum_all;
+        if (FC_reduce_via_shmem) {
+            sum_all = helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw);
+        } else {
+            sum_all = simd_sum(sumf[row]);
+        }
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all;
         }
@@ -8912,11 +9190,12 @@ kernel void kernel_mul_mv_iq1_s_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_iq1_s_f32_impl<N_R0_IQ1_S, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_iq1_s_f32_impl<N_R0_IQ1_S, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 template<int nr0, typename args_t>
@@ -9007,8 +9286,21 @@ void kernel_mul_mv_iq1_m_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        float sum_all;
+        if (FC_reduce_via_shmem) {
+            sum_all = helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw);
+        } else {
+            sum_all = simd_sum(sumf[row]);
+        }
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all;
         }
@@ -9021,11 +9313,12 @@ kernel void kernel_mul_mv_iq1_m_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_iq1_m_f32_impl<N_R0_IQ1_M, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_iq1_m_f32_impl<N_R0_IQ1_M, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 template<int NR0, typename args_t>
@@ -9060,7 +9353,8 @@ void kernel_mul_mv_iq4_nl_f32_impl(
     const int nb   = args.ne00/QK4_NL;
     const int ns01 = args.nb01/args.nb00;
 
-    const short ix = tiisg/2;  // 0...15
+    const short n_pairs = FC_nw/2; // block-stride in (ix,it) pairs: 16 at NW=32, 8 at NW=16
+    const short ix = tiisg/2;  // 0...n_pairs-1
     const short it = tiisg%2;  // 0 or 1
 
     shmem_f32[tiisg] = kvalues_iq4nl_f[tiisg%16];
@@ -9077,7 +9371,7 @@ void kernel_mul_mv_iq4_nl_f32_impl(
     float4 qf1, qf2;
 
     // [TAG_MUL_MV_WEIRD]
-    for (int ib = ix; ib < nb && ib < ns01; ib += 16) {
+    for (int ib = ix; ib < nb && ib < ns01; ib += n_pairs) {
         device const float4 * y4 = (device const float4 *)yb;
         yl[0] = y4[0];
         yl[1] = y4[4];
@@ -9111,13 +9405,26 @@ void kernel_mul_mv_iq4_nl_f32_impl(
             sumf[row] += (float)xb.d * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
         }
 
-        yb += 16 * QK4_NL;
+        yb += n_pairs * QK4_NL;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        float sum_all;
+        if (FC_reduce_via_shmem) {
+            sum_all = helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw);
+        } else {
+            sum_all = simd_sum(sumf[row]);
+        }
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all;
         }
@@ -9226,8 +9533,21 @@ void kernel_mul_mv_iq4_xs_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        float sum_all;
+        if (FC_reduce_via_shmem) {
+            sum_all = helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw);
+        } else {
+            sum_all = simd_sum(sumf[row]);
+        }
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all;
         }
@@ -9280,7 +9600,8 @@ void kernel_mul_mv_mxfp4_f32_impl(
     const int nb   = args.ne00/QK_MXFP4;
     const int ns01 = args.nb01/args.nb00; // this can be larger than nb for permuted src0 tensors
 
-    const short ix = tiisg/2;  // 0...15
+    const short n_pairs = FC_nw/2; // block-stride in (ix,it) pairs: 16 at NW=32, 8 at NW=16
+    const short ix = tiisg/2;  // 0...n_pairs-1
     const short it = tiisg%2;  // 0 or 1
 
     shmem_f32[tiisg] = kvalues_mxfp4_f[tiisg%16];
@@ -9293,7 +9614,7 @@ void kernel_mul_mv_mxfp4_f32_impl(
 
     // note: just the check `ib < nb` is enough, but adding the redundant `&& ib < ns01` check makes the kernel a bit faster
     //       no idea why that is - needs some deeper investigation [TAG_MUL_MV_WEIRD]
-    for (int ib = ix; ib < nb && ib < ns01; ib += 16) {
+    for (int ib = ix; ib < nb && ib < ns01; ib += n_pairs) {
         device const float4 * y4 = (device const float4 *) yb;
 
         yl[0] = y4[0];
@@ -9315,13 +9636,26 @@ void kernel_mul_mv_mxfp4_f32_impl(
             sumf[row] += e8m0_to_fp32(xb.e) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
         }
 
-        yb += 16 * QK_MXFP4;
+        yb += n_pairs * QK_MXFP4;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
+    // Kernels that staged a dequant table in shmem must let every simdgroup
+    // finish reading it before the shmem-path reduction reuses the buffer.
+    // Reached uniformly (straight-line after the uniform compute loop) and
+    // compile-time eliminated on the simd path.
+    if (FC_reduce_via_shmem) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        float sum_all;
+        if (FC_reduce_via_shmem) {
+            sum_all = helper_sg_reduce_sum(sumf[row], (threadgroup float *) shmem, sgitg, tiisg, FC_nw);
+        } else {
+            sum_all = simd_sum(sumf[row]);
+        }
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all;
         }

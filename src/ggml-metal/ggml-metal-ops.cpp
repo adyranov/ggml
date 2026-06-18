@@ -2227,7 +2227,15 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const int nr1 = pipeline.nr1;
         const int nsg = pipeline.nsg;
 
-        const size_t smem = pipeline.smem;
+        // On the shmem reduction path the mat-vec kernels reduce through a
+        // barrier-based threadgroup buffer instead of simd_sum, needing one
+        // float per thread (nsg simdgroups * simd_width lanes). Inert on the
+        // simd path, where reduce_via_shmem is false and pipeline.smem stands.
+        size_t smem = pipeline.smem;
+        if (props_dev->reduce_via_shmem) {
+            const int sw = props_dev->simd_width > 0 ? props_dev->simd_width : 32;
+            smem = std::max<size_t>(smem, GGML_PAD((size_t) nsg*sw*sizeof(float), 16));
+        }
 
         ggml_metal_kargs_mul_mv args = {
             /*.ne00 =*/ ne00,
@@ -2423,7 +2431,16 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         const int nr1 = pipeline.nr1;
         const int nsg = pipeline.nsg;
 
-        const size_t smem = pipeline.smem;
+        // Same shmem-path reduction buffer as the dense mat-vec dispatch: the
+        // scalar mul_mv_id kernels reuse the mat-vec impls, so they need one
+        // float per thread (nsg * simd_width) for the barrier reduction. Inert
+        // on the simd path. (mxfp4/iq* also stage a dequant table here, but the
+        // table is smaller than the reduction buffer, which is sized as the max.)
+        size_t smem = pipeline.smem;
+        if (props_dev->reduce_via_shmem) {
+            const int sw = props_dev->simd_width > 0 ? props_dev->simd_width : 32;
+            smem = std::max<size_t>(smem, GGML_PAD((size_t) nsg*sw*sizeof(float), 16));
+        }
 
         ggml_metal_kargs_mul_mv_id args = {
             /*.nei0 =*/ ne20,
