@@ -1854,7 +1854,7 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
             id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
             [encoder fillBuffer:bid_dst.metal
-                          range:NSMakeRange(bid_dst.offs, bid_dst.offs + size)
+                          range:NSMakeRange(bid_dst.offs, size)
                           value:value];
 
             [encoder endEncoding];
@@ -1878,6 +1878,11 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
                                                                length:size
                                                               options:MTLResourceStorageModeShared
                                                           deallocator:nil];
+        if (buf_src == nil) {
+            buf_src = [buf->dev->mtl_device newBufferWithBytes:data_ptr
+                                                        length:size
+                                                       options:MTLResourceStorageModeShared];
+        }
 
         GGML_ASSERT(buf_src);
 
@@ -1914,6 +1919,7 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
 
         dispatch_semaphore_wait(completion_semaphore, DISPATCH_TIME_FOREVER);
         dispatch_release(completion_semaphore);
+        [buf_src release];
 
         //[cmd_buf waitUntilCompleted];
     }
@@ -1935,6 +1941,10 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
                                                                length:size
                                                               options:MTLResourceStorageModeShared
                                                           deallocator:nil];
+        const bool copy_dst = buf_dst == nil;
+        if (copy_dst) {
+            buf_dst = [buf->dev->mtl_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+        }
 
         GGML_ASSERT(buf_dst);
 
@@ -1954,6 +1964,11 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+
+        if (copy_dst) {
+            memcpy(data, [buf_dst contents], size);
+        }
+        [buf_dst release];
     }
 }
 
