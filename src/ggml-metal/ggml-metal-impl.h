@@ -1181,4 +1181,15 @@ typedef struct {
     int64_t  np;
 } ggml_metal_kargs_opt_step_sgd;
 
+// Tile geometry for the shared-memory GEMM kernels (kernel_mul_mat_tiled_* and
+// kernel_mul_mat_id_tiled_*). Shared between the kernels and the host so the
+// dynamic threadgroup-memory size is computed from a single source of truth.
+#define GGML_METAL_TILED_BM           64
+#define GGML_METAL_TILED_BN           64
+#define GGML_METAL_TILED_BK           32
+#define GGML_METAL_TILED_SHMEM_STRIDE (GGML_METAL_TILED_BK / 2 + 1) // +1 avoids bank conflicts
+// buf_a[BM*STRIDE] + buf_b[BN*STRIDE], both float2.
+#define GGML_METAL_TILED_SMEM \
+    ((size_t)(GGML_METAL_TILED_BM + GGML_METAL_TILED_BN) * GGML_METAL_TILED_SHMEM_STRIDE * 2 * sizeof(float))
+
 #endif // GGML_METAL_IMPL
