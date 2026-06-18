@@ -2237,6 +2237,140 @@ template [[host_name("kernel_soft_max_f32")]]   kernel kernel_soft_max_t   kerne
 template [[host_name("kernel_soft_max_f16_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<half4>;
 template [[host_name("kernel_soft_max_f32_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<float4>;
 
+// Fused MoE expert selection: gating (softmax/sigmoid) -> top-k argmax ->
+// optional weight normalization / delayed softmax / scale, collapsing the
+// soft_max/argsort/get_rows/sum_rows/clamp/div decode chain into one dispatch.
+// One threadgroup per token row; reductions use barrier-based threadgroup
+// scratch so the kernel is correct on every Metal device (incl. Intel).
+// gating: 1 = softmax, 2 = sigmoid, 0 = raw logits (delayed/weight gating).
+kernel void kernel_topk_moe(
+        constant ggml_metal_kargs_topk_moe & args,
+        device const char * src0,     // logits  [n_expert, n_rows]
+        device const char * src1,     // selection bias [n_expert] (only read when with_bias)
+        device       char * dst_w,    // weights [n_expert_used, n_rows] (f32)
+        device       char * dst_ids,  // ids     [n_expert_used, n_rows] (i32)
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort tpitg [[thread_index_in_threadgroup]],
+        ushort   ntg [[threads_per_threadgroup]]) {
+    const int row = tgpig;
+    if (row >= args.n_rows) {
+        return;
+    }
+
+    const int ne = args.n_expert;
+    const int nu = args.n_expert_used;
+
+    device const float * logits = (device const float *) (src0 + (uint64_t) row*args.nb_logits_row);
+    device const float * bias   = args.with_bias ? (device const float *) src1 : nullptr;
+
+    threadgroup float * s_prob = (threadgroup float *) shmem;       // [ne] gating output (weight source)
+    threadgroup float * s_sel  = s_prob + ne;                       // [ne] selection values (incl. bias)
+    threadgroup float * s_wgt  = s_sel  + ne;                       // [nu] selected weights
+    threadgroup float * r_val  = s_wgt  + nu;                       // [ntg] reduction scratch (values)
+    threadgroup int   * r_idx  = (threadgroup int *) (r_val + ntg); // [ntg] reduction scratch (indices)
+
+    for (int e = tpitg; e < ne; e += ntg) {
+        s_prob[e] = logits[e];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (args.gating == 1 && !args.delayed_softmax) {
+        float lmax = -INFINITY;
+        for (int e = tpitg; e < ne; e += ntg) {
+            lmax = max(lmax, s_prob[e]);
+        }
+        const float mx = helper_tg_reduce_max(lmax, r_val, tpitg, ntg);
+
+        float lsum = 0.0f;
+        for (int e = tpitg; e < ne; e += ntg) {
+            const float v = exp(s_prob[e] - mx);
+            s_prob[e] = v;
+            lsum += v;
+        }
+        const float inv = 1.0f/helper_tg_reduce_sum(lsum, r_val, tpitg, ntg);
+        for (int e = tpitg; e < ne; e += ntg) {
+            s_prob[e] *= inv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else if (args.gating == 2) {
+        for (int e = tpitg; e < ne; e += ntg) {
+            s_prob[e] = 1.0f/(1.0f + exp(-s_prob[e]));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // sanitize NaN so the iterative argmax produces unique experts, then add the
+    // selection bias (selection uses probs+bias, weights use unbiased probs).
+    for (int e = tpitg; e < ne; e += ntg) {
+        float p = s_prob[e];
+        if (isnan(p)) {
+            p = -FLT_MAX;
+            s_prob[e] = p;
+        }
+        s_sel[e] = p + (bias ? bias[e] : 0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int k = 0; k < nu; ++k) {
+        float lmax = -INFINITY;
+        int   larg = -1;
+        for (int e = tpitg; e < ne; e += ntg) {
+            const float v = s_sel[e];
+            if (v > lmax) {
+                lmax = v;
+                larg = e;
+            }
+        }
+        const int arg = helper_tg_argmax(lmax, larg, r_val, r_idx, tpitg, ntg);
+        if (tpitg == 0) {
+            s_wgt[k] = s_prob[arg];
+            s_sel[arg] = -INFINITY; // exclude from the next round
+            *(device int32_t *) (dst_ids + (uint64_t) row*args.nb_ids_row + (uint64_t) k*args.nb_ids_k) = arg;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (args.with_norm) {
+        float lsum = 0.0f;
+        for (int k = tpitg; k < nu; k += ntg) {
+            lsum += s_wgt[k];
+        }
+        float sm = helper_tg_reduce_sum(lsum, r_val, tpitg, ntg);
+        sm = max(sm, args.clamp_val);
+        const float inv = 1.0f/sm;
+        for (int k = tpitg; k < nu; k += ntg) {
+            s_wgt[k] *= inv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (args.delayed_softmax) {
+        float lmax = -INFINITY;
+        for (int k = tpitg; k < nu; k += ntg) {
+            lmax = max(lmax, s_wgt[k]);
+        }
+        const float mx = helper_tg_reduce_max(lmax, r_val, tpitg, ntg);
+
+        float lsum = 0.0f;
+        for (int k = tpitg; k < nu; k += ntg) {
+            const float v = exp(s_wgt[k] - mx);
+            s_wgt[k] = v;
+            lsum += v;
+        }
+        const float inv = 1.0f/helper_tg_reduce_sum(lsum, r_val, tpitg, ntg);
+        for (int k = tpitg; k < nu; k += ntg) {
+            s_wgt[k] *= inv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float sc = args.with_scale ? args.scale_val : 1.0f;
+    for (int k = tpitg; k < nu; k += ntg) {
+        *(device float *) (dst_w + (uint64_t) row*args.nb_weights_row + (uint64_t) k*args.nb_weights_k) = s_wgt[k]*sc;
+    }
+}
+
 // ref: ggml.c:ggml_compute_forward_ssm_conv_f32
 kernel void kernel_ssm_conv_f32_f32(
         constant ggml_metal_kargs_ssm_conv & args,

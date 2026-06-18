@@ -846,6 +846,24 @@ typedef struct {
 } ggml_metal_kargs_soft_max;
 
 typedef struct {
+    int32_t  n_expert;
+    int32_t  n_expert_used;
+    int32_t  n_rows;
+    uint64_t nb_logits_row;
+    uint64_t nb_weights_row;
+    uint64_t nb_weights_k;
+    uint64_t nb_ids_row;
+    uint64_t nb_ids_k;
+    float    clamp_val;
+    float    scale_val;
+    int32_t  gating;          // 1 = softmax, 2 = sigmoid, 0 = raw logits
+    bool     delayed_softmax;
+    bool     with_norm;
+    bool     with_bias;
+    bool     with_scale;
+} ggml_metal_kargs_topk_moe;
+
+typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;

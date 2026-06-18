@@ -88,6 +88,27 @@ struct ggml_metal_op {
         return ggml_can_fuse_ext(gf, idxs.data() + i0, ops, n_ops);
     }
 
+    // raw (unfiltered) graph access for subgraph fusion that spans elided
+    // view/reshape nodes (which are dropped from the filtered idxs list).
+    const ggml_cgraph * graph() const { return gf; }
+
+    // raw graph index of the i-th filtered node.
+    int idx_raw(int i) const { return idxs[i]; }
+
+    // number of filtered nodes, starting at filtered index i0, whose raw graph
+    // index is <= raw_end. idxs is sorted, so this stops at the split boundary.
+    int n_fuse_until(int i0, int raw_end) const {
+        int n = 0;
+        for (int j = i0; j < (int) idxs.size() && idxs[j] <= raw_end; ++j) {
+            n++;
+        }
+        return n;
+    }
+
+    bool can_fuse_subgraph(const int * node_idxs, int count, const ggml_op * ops, const int * outputs, int num_outputs) const {
+        return ggml_can_fuse_subgraph_ext(gf, node_idxs, count, ops, outputs, num_outputs);
+    }
+
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
     ggml_metal_encoder_t enc;
@@ -259,6 +280,20 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                 GGML_LOG_DEBUG("%s: node  - %4s [%5lld, %5lld, %5lld, %5lld] [%5lld, %5lld, %5lld, %5lld], 1, %s\n", __func__, ggml_type_name(node->type), ne0, ne1, ne2, ne3, nb0, nb1, nb2, nb3,
                         node->name);
             }
+        }
+    }
+
+    // attempt the fused topk-moe path before the per-op dispatch; on a match it
+    // consumes the whole gating/argsort/get_rows(/norm/scale) chain in one go.
+    if (ctx->use_fusion && (node->op == GGML_OP_SOFT_MAX || node->op == GGML_OP_UNARY)) {
+        const int n_topk = ggml_metal_op_topk_moe(ctx, idx);
+        if (n_topk > 0) {
+            for (int i = 0; i < n_topk; ++i) {
+                if (!ggml_metal_op_concurrency_add(ctx, ctx->node(idx + i))) {
+                    ggml_metal_op_concurrency_reset(ctx);
+                }
+            }
+            return n_topk;
         }
     }
 
@@ -1394,6 +1429,344 @@ int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
 
     return 1;
+}
+
+// Fused MoE expert selection (topk-moe). Mirrors the CUDA fusion: a gating op
+// (softmax/sigmoid) followed by argsort_top_k -> get_rows, optionally followed
+// by weight normalization (sum_rows/clamp/div) and/or a scale. Collapsing this
+// chain into one dispatch removes ~5-7 tiny serialized dispatches per MoE layer,
+// which dominate decode latency on discrete GPUs. The decode-path delayed-softmax
+// (gpt-oss) and expert-group (deepseek) variants are left to the decomposed path.
+struct ggml_metal_topk_moe_match {
+    int  gating    = 0;     // 1 = softmax, 2 = sigmoid
+    bool with_bias = false;
+    bool with_norm = false;
+    bool with_scale = false;
+
+    const ggml_tensor * gate    = nullptr; // gating node (for op-param checks)
+    const ggml_tensor * logits  = nullptr;
+    const ggml_tensor * bias    = nullptr;
+    const ggml_tensor * clamp   = nullptr;
+    const ggml_tensor * scale   = nullptr;
+    ggml_tensor *       ids     = nullptr; // selected experts (argsort_top_k view)
+    ggml_tensor *       weights = nullptr; // routing weights (subgraph output)
+
+    int idxs[16] = {};     // raw graph indices of the matched nodes (unsorted)
+    int n_match  = 0;      // number of matched nodes
+};
+
+// Locate the lowest-index node in (r0, r0+window) with the given op and source
+// linkage. The Metal concurrency reorder can interleave unrelated (mostly empty)
+// nodes into the routing chain, so the chain is matched by data flow rather than
+// by fixed offsets. Source pointers are unique per layer, so the window only has
+// to be wide enough to span the (possibly reordered) chain.
+static int ggml_metal_topk_moe_find(const ggml_cgraph * gf, int r0, int window,
+        ggml_op op, const ggml_tensor * s0, const ggml_tensor * s1) {
+    const int end = (r0 + window < gf->n_nodes) ? r0 + window : gf->n_nodes;
+    for (int j = r0 + 1; j < end; ++j) {
+        const ggml_tensor * n = gf->nodes[j];
+        if (n->op != op) {
+            continue;
+        }
+        if (s0 && n->src[0] != s0) {
+            continue;
+        }
+        if (s1 && n->src[1] != s1) {
+            continue;
+        }
+        return j;
+    }
+    return -1;
+}
+
+static bool ggml_metal_topk_moe_match_subgraph(const ggml_cgraph * gf, int r0, ggml_metal_topk_moe_match & m, const char ** why) {
+    constexpr int WINDOW = 48;
+    ggml_tensor ** nodes = gf->nodes;
+
+    if (nodes[r0]->op == GGML_OP_SOFT_MAX) {
+        m.gating = 1;
+    } else if (nodes[r0]->op == GGML_OP_UNARY && ggml_get_unary_op(nodes[r0]) == GGML_UNARY_OP_SIGMOID) {
+        m.gating = 2;
+    } else {
+        *why = "gate-not-softmax/sigmoid";
+        return false;
+    }
+    m.gate   = nodes[r0];
+    m.logits = nodes[r0]->src[0];
+    m.idxs[m.n_match++] = r0;
+
+    // gate -> RESHAPE [1, n_expert, n_tokens]
+    const int i_reshape = ggml_metal_topk_moe_find(gf, r0, WINDOW, GGML_OP_RESHAPE, nodes[r0], nullptr);
+    if (i_reshape < 0) {
+        *why = "no-reshape-of-gate";
+        return false;
+    }
+    ggml_tensor * probs_reshaped = nodes[i_reshape];
+    m.idxs[m.n_match++] = i_reshape;
+
+    // ARGSORT over the unreshaped probs, or over an optional expert-selection bias add
+    int i_argsort = ggml_metal_topk_moe_find(gf, r0, WINDOW, GGML_OP_ARGSORT, nodes[r0], nullptr);
+    if (i_argsort < 0) {
+        const int i_bias = ggml_metal_topk_moe_find(gf, r0, WINDOW, GGML_OP_ADD, nodes[r0], nullptr);
+        if (i_bias < 0) {
+            *why = "no-argsort/bias-of-gate";
+            return false;
+        }
+        i_argsort = ggml_metal_topk_moe_find(gf, r0, WINDOW, GGML_OP_ARGSORT, nodes[i_bias], nullptr);
+        if (i_argsort < 0) {
+            *why = "no-argsort-of-bias";
+            return false;
+        }
+        m.with_bias = true;
+        m.bias      = nodes[i_bias]->src[1];
+        m.idxs[m.n_match++] = i_bias;
+    }
+    m.idxs[m.n_match++] = i_argsort;
+
+    // ARGSORT -> VIEW (top-k selection = ids output)
+    const int i_view = ggml_metal_topk_moe_find(gf, r0, WINDOW, GGML_OP_VIEW, nodes[i_argsort], nullptr);
+    if (i_view < 0) {
+        *why = "no-view-of-argsort";
+        return false;
+    }
+    m.ids = nodes[i_view];
+    m.idxs[m.n_match++] = i_view;
+
+    // GET_ROWS(probs_reshaped, ids) = routing weights
+    const int i_get = ggml_metal_topk_moe_find(gf, r0, WINDOW, GGML_OP_GET_ROWS, probs_reshaped, m.ids);
+    if (i_get < 0) {
+        *why = "no-get_rows(reshape,ids)";
+        return false;
+    }
+    m.weights = nodes[i_get];
+    m.idxs[m.n_match++] = i_get;
+
+    // optional normalization: RESHAPE -> SUM_ROWS -> CLAMP -> DIV -> RESHAPE
+    const int i_nr0 = ggml_metal_topk_moe_find(gf, r0, WINDOW, GGML_OP_RESHAPE,  m.weights,      nullptr);
+    const int i_sum = i_nr0 < 0 ? -1 : ggml_metal_topk_moe_find(gf, r0, WINDOW, GGML_OP_SUM_ROWS, nodes[i_nr0],   nullptr);
+    const int i_cl  = i_sum < 0 ? -1 : ggml_metal_topk_moe_find(gf, r0, WINDOW, GGML_OP_CLAMP,    nodes[i_sum],   nullptr);
+    const int i_div = i_cl  < 0 ? -1 : ggml_metal_topk_moe_find(gf, r0, WINDOW, GGML_OP_DIV,      nodes[i_nr0],   nodes[i_cl]);
+    const int i_nr1 = i_div < 0 ? -1 : ggml_metal_topk_moe_find(gf, r0, WINDOW, GGML_OP_RESHAPE,  nodes[i_div],   nullptr);
+    if (i_nr1 >= 0) {
+        m.with_norm = true;
+        m.clamp     = nodes[i_cl];
+        m.weights   = nodes[i_nr1];
+        m.idxs[m.n_match++] = i_nr0;
+        m.idxs[m.n_match++] = i_sum;
+        m.idxs[m.n_match++] = i_cl;
+        m.idxs[m.n_match++] = i_div;
+        m.idxs[m.n_match++] = i_nr1;
+    }
+
+    // optional weight scale
+    const int i_scale = ggml_metal_topk_moe_find(gf, r0, WINDOW, GGML_OP_SCALE, m.weights, nullptr);
+    if (i_scale >= 0) {
+        m.with_scale = true;
+        m.scale      = nodes[i_scale];
+        m.weights    = nodes[i_scale];
+        m.idxs[m.n_match++] = i_scale;
+    }
+
+    return true;
+}
+
+static bool ggml_metal_topk_moe_should_use(const ggml_metal_topk_moe_match & m, const char ** why) {
+    const ggml_tensor * ids    = m.ids;
+    const ggml_tensor * logits = m.logits;
+
+    // decode-only: a single token row avoids any input/output aliasing hazard
+    // between rows (each row is read fully before its outputs are written).
+    if (logits->ne[1] != 1) {
+        *why = "multi-token-row (prompt/prefill)";
+        return false;
+    }
+
+    const int64_t n_expert = ids->nb[1] / ids->nb[0];
+    if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 576) {
+        *why = "n_expert-not-pow2";
+        return false;
+    }
+
+    if (!ggml_is_contiguous(m.weights) || !ggml_is_contiguous(logits)) {
+        *why = "non-contiguous-weights/logits";
+        return false;
+    }
+
+    if (m.gating == 1) {
+        float scale    = 1.0f;
+        float max_bias = 0.0f;
+        memcpy(&scale,    ((const float *) m.gate->op_params) + 0, sizeof(float));
+        memcpy(&max_bias, ((const float *) m.gate->op_params) + 1, sizeof(float));
+        if (scale != 1.0f || max_bias != 0.0f) {
+            *why = "softmax-scale/max_bias";
+            return false;
+        }
+        // mask / sink present -> not a plain routing softmax
+        if (m.gate->src[1] || m.gate->src[2]) {
+            *why = "softmax-mask/sink";
+            return false;
+        }
+        if (!ggml_is_contiguous(m.gate->src[0])) {
+            *why = "non-contiguous-softmax-src";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+int ggml_metal_op_topk_moe(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * node = ctx->node(idx);
+
+    if (node->op != GGML_OP_SOFT_MAX && node->op != GGML_OP_UNARY) {
+        return 0;
+    }
+
+    const ggml_cgraph * gf = ctx->graph();
+    const int r0 = ctx->idx_raw(idx);
+    const bool dbg = ctx->debug_fusion > 0;
+
+    ggml_metal_topk_moe_match m;
+    const char * why = "?";
+    if (!ggml_metal_topk_moe_match_subgraph(gf, r0, m, &why)) {
+        // only report gates that began a plausible routing chain (gate + reshape),
+        // so unrelated softmax/sigmoid nodes do not flood the funnel.
+        if (dbg && m.n_match > 1) {
+            GGML_LOG_DEBUG("%s: no-fuse TOPK_MOE r0=%d: %s\n", __func__, r0, why);
+        }
+        return 0;
+    }
+    if (!ggml_metal_topk_moe_should_use(m, &why)) {
+        if (dbg) {
+            GGML_LOG_DEBUG("%s: no-fuse TOPK_MOE r0=%d: %s\n", __func__, r0, why);
+        }
+        return 0;
+    }
+
+    // the concurrency reorder may interleave unrelated nodes between the matched
+    // ones, so build the node list from the captured indices (sorted) rather than
+    // from a contiguous span.
+    GGML_ASSERT(m.n_match <= 16);
+    int node_idxs[16];
+    ggml_op ops[16];
+    for (int k = 0; k < m.n_match; ++k) {
+        node_idxs[k] = m.idxs[k];
+    }
+    std::sort(node_idxs, node_idxs + m.n_match);
+
+    const int raw_end = node_idxs[m.n_match - 1];
+
+    int out_ids = -1;
+    int out_wgt = -1;
+    int matched_nonempty = 0;
+    for (int k = 0; k < m.n_match; ++k) {
+        ops[k] = gf->nodes[node_idxs[k]]->op;
+        if (!ggml_op_is_empty(ops[k])) {
+            matched_nonempty++;
+        }
+        if (gf->nodes[node_idxs[k]] == m.ids)     { out_ids = node_idxs[k]; }
+        if (gf->nodes[node_idxs[k]] == m.weights) { out_wgt = node_idxs[k]; }
+    }
+    if (out_ids < 0 || out_wgt < 0) {
+        if (dbg) {
+            GGML_LOG_DEBUG("%s: no-fuse TOPK_MOE r0=%d: outputs-not-located\n", __func__, r0);
+        }
+        return 0;
+    }
+
+    // verify the subgraph lies within the current encoder split and that no
+    // foreign non-empty node is interleaved: the non-empty node count over
+    // [r0, raw_end] must equal both the matched non-empty count and the filtered
+    // span. Interleaved empty (reshape/view) nodes are no-ops and are ignored.
+    int n_nonempty = 0;
+    for (int k = r0; k <= raw_end; ++k) {
+        if (!ggml_op_is_empty(gf->nodes[k]->op)) {
+            n_nonempty++;
+        }
+    }
+    const int n_fuse = ctx->n_fuse_until(idx, raw_end);
+    if (n_fuse != n_nonempty || n_nonempty != matched_nonempty) {
+        if (dbg) {
+            GGML_LOG_DEBUG("%s: no-fuse TOPK_MOE r0=%d: foreign-node-in-span "
+                    "(n_fuse=%d n_nonempty=%d matched=%d)\n",
+                    __func__, r0, n_fuse, n_nonempty, matched_nonempty);
+        }
+        return 0;
+    }
+
+    const int outputs[2] = { out_ids, out_wgt };
+    if (!ctx->can_fuse_subgraph(node_idxs, m.n_match, ops, outputs, 2)) {
+        if (dbg) {
+            GGML_LOG_DEBUG("%s: no-fuse TOPK_MOE r0=%d: can_fuse_subgraph-rejected\n", __func__, r0);
+        }
+        return 0;
+    }
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const int32_t n_expert      = (int32_t) (m.ids->nb[1] / m.ids->nb[0]);
+    const int32_t n_expert_used = (int32_t) m.ids->ne[0];
+    const int32_t n_rows        = (int32_t) m.logits->ne[1];
+
+    float clamp_val = -INFINITY;
+    if (m.with_norm) {
+        memcpy(&clamp_val, ((const float *) m.clamp->op_params) + 0, sizeof(float));
+    }
+    float scale_val = 1.0f;
+    if (m.with_scale) {
+        memcpy(&scale_val, ((const float *) m.scale->op_params) + 0, sizeof(float));
+    }
+
+    ggml_metal_kargs_topk_moe args = {
+        /*.n_expert        =*/ n_expert,
+        /*.n_expert_used   =*/ n_expert_used,
+        /*.n_rows          =*/ n_rows,
+        /*.nb_logits_row   =*/ m.logits->nb[1],
+        /*.nb_weights_row  =*/ m.weights->nb[2],
+        /*.nb_weights_k    =*/ m.weights->nb[1],
+        /*.nb_ids_row      =*/ m.ids->nb[1],
+        /*.nb_ids_k        =*/ m.ids->nb[0],
+        /*.clamp_val       =*/ clamp_val,
+        /*.scale_val       =*/ scale_val,
+        /*.gating          =*/ m.gating,
+        /*.delayed_softmax =*/ false,
+        /*.with_norm       =*/ m.with_norm,
+        /*.with_bias       =*/ m.with_bias,
+        /*.with_scale      =*/ m.with_scale,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_topk_moe(lib);
+
+    int nth = 32;
+    while (nth < n_expert && nth < 256) {
+        nth *= 2;
+    }
+
+    const size_t smem = GGML_PAD((2*(size_t) n_expert + n_expert_used)*sizeof(float) +
+                                 nth*sizeof(float) + nth*sizeof(int32_t), 16);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(m.logits), 1);
+    if (m.with_bias) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(m.bias), 2);
+    } else {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(m.logits), 2);
+    }
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(m.weights), 3);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(m.ids), 4);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_rows, 1, 1, nth, 1, 1);
+
+    if (ctx->debug_fusion > 0) {
+        GGML_LOG_DEBUG("%s: fuse: TOPK_MOE x %d (gating=%d norm=%d bias=%d scale=%d n_expert=%d n_used=%d)\n",
+                __func__, n_fuse, m.gating, m.with_norm, m.with_bias, m.with_scale, n_expert, n_expert_used);
+    }
+
+    return n_fuse;
 }
 
 int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
