@@ -2049,6 +2049,39 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// Tiled shared-memory GEMM kernel suffix for src0 type, or NULL if no tiled
+// kernel is compiled for it. The tiled path is for GPUs without simdgroup
+// matrix-multiply (AMD/Intel), where batched matmul otherwise falls back to the
+// slow per-column mul_mv kernel and trips the GPU watchdog on prefill.
+static const char * ggml_metal_mul_mat_tiled_suffix(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F16:     return "f16";
+        case GGML_TYPE_F32:     return "f32";
+        case GGML_TYPE_BF16:    return "bf16";
+        case GGML_TYPE_MXFP4:   return "mxfp4";
+        case GGML_TYPE_Q8_0:    return "q8_0";
+        case GGML_TYPE_Q4_0:    return "q4_0";
+        case GGML_TYPE_Q4_1:    return "q4_1";
+        case GGML_TYPE_Q5_0:    return "q5_0";
+        case GGML_TYPE_Q5_1:    return "q5_1";
+        case GGML_TYPE_IQ4_NL:  return "iq4_nl";
+        case GGML_TYPE_Q4_K:    return "q4_K";
+        case GGML_TYPE_Q5_K:    return "q5_K";
+        case GGML_TYPE_Q6_K:    return "q6_K";
+        case GGML_TYPE_Q2_K:    return "q2_K";
+        case GGML_TYPE_Q3_K:    return "q3_K";
+        case GGML_TYPE_IQ4_XS:  return "iq4_xs";
+        case GGML_TYPE_IQ2_XXS: return "iq2_xxs";
+        case GGML_TYPE_IQ2_XS:  return "iq2_xs";
+        case GGML_TYPE_IQ2_S:   return "iq2_s";
+        case GGML_TYPE_IQ3_XXS: return "iq3_xxs";
+        case GGML_TYPE_IQ3_S:   return "iq3_s";
+        case GGML_TYPE_IQ1_S:   return "iq1_s";
+        case GGML_TYPE_IQ1_M:   return "iq1_m";
+        default:                return NULL;
+    }
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2177,6 +2210,51 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + r0ptg - 1)/r0ptg), ((ne11 + r1ptg - 1)/r1ptg), ne12*ne13, 32, nsg, 1);
+    } else if (
+        (getenv("GGML_METAL_MM_TILED") != NULL || !props_dev->has_simdgroup_mm) &&
+        !ggml_is_transposed(op->src[0]) &&
+        op->src[1]->type == GGML_TYPE_F32 &&
+        ne01 >= 64 &&               // need at least one full BM=64 output-row tile
+        ne11 > ne11_mm_min &&
+        ggml_metal_mul_mat_tiled_suffix(op->src[0]->type) != NULL) {
+        // Tiled shared-memory GEMM for GPUs without simdgroup matrix-multiply (AMD/Intel).
+        // GGML_METAL_MM_TILED=1 forces this path on any device (validation aid).
+        // A transposed src1 (nb10 > nb11) is consumed directly via the ks1 K-stride in
+        // the kernel's B-loader, so no ggml_cont(ggml_transpose(...)) copy is required.
+        char kernel_name[64];
+        snprintf(kernel_name, sizeof(kernel_name), "kernel_mul_mat_tiled_%s",
+                 ggml_metal_mul_mat_tiled_suffix(op->src[0]->type));
+
+        auto pipeline = ggml_metal_library_compile_pipeline(lib, kernel_name, kernel_name, NULL);
+        GGML_ASSERT(pipeline.pipeline && "failed to compile tiled matmul pipeline");
+
+        ggml_metal_kargs_mul_mm args = {
+            /*.ne00 =*/ ne00,
+            /*.ne02 =*/ ne02,
+            /*.nb01 =*/ nb01,
+            /*.nb02 =*/ nb02,
+            /*.nb03 =*/ nb03,
+            /*.ne12 =*/ ne12,
+            /*.nb10 =*/ nb10,
+            /*.nb11 =*/ nb11,
+            /*.nb12 =*/ nb12,
+            /*.nb13 =*/ nb13,
+            /*.ne0  =*/ ne0,
+            /*.ne1  =*/ ne1,
+            /*.r2   =*/ r2,
+            /*.r3   =*/ r3,
+        };
+
+        const size_t smem = GGML_METAL_TILED_SMEM;
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 63)/64, (ne11 + 63)/64, ne12*ne13, 128, 1, 1);
     } else if (
         !ggml_is_transposed(op->src[0]) &&
         !ggml_is_transposed(op->src[1]) &&
@@ -2345,7 +2423,25 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     // ne21 = n_rows (batch size)
     const int ne21_mm_id_min = 32;
 
-    if (props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
+    // Tiled indirect matmul for GPUs without simdgroup matrix-multiply: reuses the
+    // same break-even and id-map prepass as the simdgroup path, but runs each
+    // expert's GEMM in the shared-memory tiled kernel instead of falling back to
+    // the slow per-column mul_mv_id. GGML_METAL_MM_TILED forces it on any device
+    // (validation aid). The id-map scratch is always reserved (see
+    // ggml_backend_metal_buffer_type_get_alloc_size), so this is safe wherever the
+    // simdgroup path would have run.
+    const char * tiled_id_suffix = ggml_metal_mul_mat_tiled_suffix(op->src[0]->type);
+    const bool can_tiled_id =
+        (getenv("GGML_METAL_MM_TILED") != NULL || !props_dev->has_simdgroup_mm) &&
+        tiled_id_suffix != NULL &&
+        !ggml_is_transposed(op->src[0]) &&
+        !ggml_is_transposed(op->src[1]) &&
+        op->src[1]->type == GGML_TYPE_F32 &&
+        ne00 >= 64 &&
+        ne21 >= ne21_mm_id_min;
+    const bool can_mm_id = props_dev->has_simdgroup_mm && ne00 >= 64 && ne21 >= ne21_mm_id_min;
+
+    if (can_mm_id || can_tiled_id) {
         // some Metal matrix data types require aligned pointers
         // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf (Table 2.5)
         //switch (op->src[0]->type) {
@@ -2396,7 +2492,50 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         // this barrier is always needed because the next kernel has to wait for the id maps to be computed
         ggml_metal_op_concurrency_reset(ctx);
 
-        {
+        if (can_tiled_id) {
+            char kernel_name[64];
+            snprintf(kernel_name, sizeof(kernel_name), "kernel_mul_mat_id_tiled_%s", tiled_id_suffix);
+
+            auto pipeline = ggml_metal_library_compile_pipeline(lib, kernel_name, kernel_name, NULL);
+            GGML_ASSERT(pipeline.pipeline && "failed to compile tiled mul_mat_id pipeline");
+
+            ggml_metal_kargs_mul_mm_id args = {
+                /*.ne00  =*/ ne00,
+                /*.ne02  =*/ ne02,
+                /*.nb01  =*/ nb01,
+                /*.nb02  =*/ nb02,
+                /*.nb03  =*/ nb03,
+                /*.ne11  =*/ ne11, // n_expert_used (bcast)
+                /*.nb10  =*/ nb10,
+                /*.nb11  =*/ nb11,
+                /*.nb12  =*/ nb12,
+                /*.nb13  =*/ nb13,
+                /*.ne20  =*/ ne20, // n_expert_used
+                /*.ne21  =*/ ne21, // n_tokens
+                /*.ne0   =*/ ne0,
+                /*.ne1   =*/ ne1,
+                /*.r2    =*/ r2,
+                /*.r3    =*/ r3,
+            };
+
+            const size_t smem = GGML_METAL_TILED_SMEM;
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+            ggml_metal_encoder_set_buffer  (enc, bid_tpe,  3);
+            ggml_metal_encoder_set_buffer  (enc, bid_ids,  4);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+
+            // M tiles over output features (ne0), N tiles over tokens (<= ne21),
+            // one threadgroup-z per expert; empty expert tiles early-out.
+            ggml_metal_encoder_dispatch_threadgroups(enc,
+                (ne0  + GGML_METAL_TILED_BM - 1) / GGML_METAL_TILED_BM,
+                (ne21 + GGML_METAL_TILED_BN - 1) / GGML_METAL_TILED_BN,
+                ne02, 128, 1, 1);
+        } else {
             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op);
 
             ggml_metal_kargs_mul_mm_id args = {

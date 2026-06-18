@@ -11383,3 +11383,2119 @@ kernel void kernel_count_equal(
 typedef decltype(kernel_count_equal<int32_t>) kernel_count_equal_t;
 
 template [[host_name("kernel_count_equal_i32")]] kernel kernel_count_equal_t kernel_count_equal<int32_t>;
+// Tiled matmul for GPUs without simdgroup_mm: shared-memory GEMM, flat thread
+// indices, no simdgroup intrinsics (any SIMD width). Keeps a BMxBN output tile
+// in shared memory, reduces over K in BK chunks. Avoids the per-column mul_mv
+// fallback that trips the GPU watchdog on prefill. The body is templated on a
+// per-quant A-matrix loader (see tiled_loader_*).
+
+constant constexpr int BM = GGML_METAL_TILED_BM;
+constant constexpr int BN = GGML_METAL_TILED_BN;
+constant constexpr int BK = GGML_METAL_TILED_BK;
+
+constant constexpr int WM = 32;
+constant constexpr int WN = 32;
+constant constexpr int WMITER = 2;
+constant constexpr int TM = 4;
+constant constexpr int TN = 2;
+
+constant constexpr int WARP = 32;
+constant constexpr int BLOCK_SIZE = 128;
+
+constant constexpr int SHMEM_STRIDE = BK/2 + 1;  // +1 padding to avoid bank conflicts
+
+constant constexpr int WNITER = (WM * WN) / (WARP * TM * TN * WMITER);
+constant constexpr int WSUBM = WM / WMITER;
+constant constexpr int WSUBN = WN / WNITER;
+
+constant constexpr int LOAD_VEC_A = 2;
+constant constexpr int LOAD_VEC_B = 2;
+
+typedef struct {
+    float2 buf_a[BM * SHMEM_STRIDE];
+    float2 buf_b[BN * SHMEM_STRIDE];
+} TiledSharedMemory;
+
+// Cooperative load: A tile (BM rows x BK cols, half data) into shared memory.
+inline void load_a_to_shmem(
+    device const half * data_a,
+    threadgroup float2 * buf_a,
+    uint pos_a,
+    uint loadr,
+    uint loadc,
+    uint idx_m,
+    uint ne01,
+    uint block,
+    uint end_k,
+    uint stride_a
+) {
+    const uint idx = pos_a + loadc * stride_a + loadr * LOAD_VEC_A;
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_m < ne01 && block + loadr * LOAD_VEC_A + 1 < end_k) {
+        buf_a[buf_idx] = float2(float(data_a[idx]), float(data_a[idx + 1]));
+    } else if (idx_m < ne01 && block + loadr * LOAD_VEC_A < end_k) {
+        buf_a[buf_idx] = float2(float(data_a[idx]), 0.0f);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+// Cooperative load: B tile (BN rows x BK cols, f32 data, contiguous K) into shared memory.
+inline void load_b_to_shmem(
+    device const float * data_b,
+    threadgroup float2 * buf_b,
+    uint pos_b,
+    uint loadr,
+    uint loadc,
+    uint idx_n,
+    uint ne_b_rows,
+    uint block,
+    uint end_k,
+    uint stride_b
+) {
+    const uint idx = pos_b + loadc * stride_b + loadr * LOAD_VEC_B;
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_n < ne_b_rows && block + loadr * LOAD_VEC_B + 1 < end_k) {
+        buf_b[buf_idx] = float2(data_b[idx], data_b[idx + 1]);
+    } else if (idx_n < ne_b_rows && block + loadr * LOAD_VEC_B < end_k) {
+        buf_b[buf_idx] = float2(data_b[idx], 0.0f);
+    } else {
+        buf_b[buf_idx] = float2(0.0f);
+    }
+}
+
+// Strided B-loading for transposed src1: K elements are ks1 apart in device memory.
+inline void load_b_to_shmem_strided(
+    device const float * data_b,
+    threadgroup float2 * buf_b,
+    uint pos_b,
+    uint loadr,
+    uint loadc,
+    uint idx_n,
+    uint ne_b_rows,
+    uint block,
+    uint end_k,
+    uint stride_b,
+    uint ks1
+) {
+    const uint idx_base = pos_b * ks1 + loadc * stride_b + loadr * LOAD_VEC_B * ks1;
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_n < ne_b_rows && block + loadr * LOAD_VEC_B + 1 < end_k) {
+        buf_b[buf_idx] = float2(data_b[idx_base], data_b[idx_base + ks1]);
+    } else if (idx_n < ne_b_rows && block + loadr * LOAD_VEC_B < end_k) {
+        buf_b[buf_idx] = float2(data_b[idx_base], 0.0f);
+    } else {
+        buf_b[buf_idx] = float2(0.0f);
+    }
+}
+
+// f16 A-matrix loader: typed pointer, element-based stride.
+struct tiled_loader_f16 {
+    device const half * data_a;
+    uint stride_a;
+    uint pos_a;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        data_a = (device const half *)(src0 + offset0 + args.nb01 * (ir * BM));
+        stride_a = args.nb01 / sizeof(half);
+        pos_a = 0;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_to_shmem(data_a, buf_a, pos_a, loadr, loadc, idx_m, ne01, block, end_k, stride_a);
+    }
+
+    void advance() { pos_a += BK; }
+};
+
+// Shared kernel body, templated on the A-matrix loader strategy.
+template <typename LoadA>
+kernel void kernel_mul_mat_tiled_impl(
+    constant ggml_metal_kargs_mul_mm & args [[buffer(0)]],
+    device const char * src0 [[buffer(1)]],
+    device const char * src1 [[buffer(2)]],
+    device       char * dst  [[buffer(3)]],
+    threadgroup  char * shmem [[threadgroup(0)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tid   [[thread_index_in_threadgroup]]
+) {
+    threadgroup TiledSharedMemory * shared = (threadgroup TiledSharedMemory *)shmem;
+    threadgroup float2 * buf_a = shared->buf_a;
+    threadgroup float2 * buf_b = shared->buf_b;
+
+    const uint ir = tgpig.x;  // M dimension threadgroup index
+    const uint ic = tgpig.y;  // N dimension threadgroup index
+    const uint im = tgpig.z;  // batch index
+
+    const int i12 = im % args.ne12;
+    const int i13 = im / args.ne12;
+    const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+    const uint warp_i = tid / WARP;
+    const uint tiw = tid % WARP;
+
+    const uint warp_r = warp_i % (BM / WM);
+    const uint warp_c = warp_i / (BM / WM);
+
+    const uint tiwr = tiw % (WSUBM / TM);
+    const uint tiwc = tiw / (WSUBM / TM);
+
+    const uint loadr_a = tid % (BK / LOAD_VEC_A);
+    const uint loadc_a = tid / (BK / LOAD_VEC_A);
+    const uint loadr_b = tid % (BK / LOAD_VEC_B);
+    const uint loadc_b = tid / (BK / LOAD_VEC_B);
+
+    const uint loadstride_a = BLOCK_SIZE * LOAD_VEC_A / BK;
+    const uint loadstride_b = BLOCK_SIZE * LOAD_VEC_B / BK;
+
+    LoadA loader;
+    loader.init(src0, offset0, ir, args);
+
+    device const float * data_b = (device const float *)(src1 + args.nb13*i13 + args.nb12*i12 + args.nb11*(ic*BN));
+    const uint stride_b = args.nb11 / sizeof(float);
+    const uint ks1 = args.nb10 / sizeof(float);
+
+    const uint end_k = args.ne00;
+    const uint ne01 = args.ne0;
+    const uint ne11 = args.ne1;
+
+    uint pos_b = 0;
+
+    float2 sums[WMITER * TM * WNITER * TN / 2];
+    for (uint i = 0; i < WMITER * TM * WNITER * TN / 2; i++) {
+        sums[i] = float2(0.0f);
+    }
+
+    for (uint block = 0; block < end_k; block += BK) {
+        for (uint l = 0; l < BM; l += loadstride_a) {
+            loader.load(buf_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, ne01, block, end_k);
+        }
+
+        if (ks1 > 1) {
+            for (uint l = 0; l < BN; l += loadstride_b) {
+                load_b_to_shmem_strided(data_b, buf_b, pos_b, loadr_b, loadc_b + l,
+                    ic * BN + loadc_b + l, ne11, block, end_k, stride_b, ks1);
+            }
+        } else {
+            for (uint l = 0; l < BN; l += loadstride_b) {
+                load_b_to_shmem(data_b, buf_b, pos_b, loadr_b, loadc_b + l,
+                    ic * BN + loadc_b + l, ne11, block, end_k, stride_b);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        loader.advance();
+        pos_b += BK;
+
+        float4 cache_a[WMITER * TM];
+        float4 cache_b;
+
+        for (uint i = 0; i < BK / 4; i++) {
+            for (uint wsir = 0; wsir < WMITER; wsir++) {
+                for (uint j = 0; j < TM; j++) {
+                    const uint row = warp_r * WM + wsir * WSUBM + tiwr * TM + j;
+                    cache_a[wsir * TM + j].xy = buf_a[row * SHMEM_STRIDE + 2*i    ];
+                    cache_a[wsir * TM + j].zw = buf_a[row * SHMEM_STRIDE + 2*i + 1];
+                }
+            }
+
+            for (uint wsic = 0; wsic < WNITER; wsic++) {
+                for (uint cc = 0; cc < TN; cc++) {
+                    const uint col = warp_c * WN + wsic * WSUBN + tiwc * TN + cc;
+                    cache_b.xy = buf_b[col * SHMEM_STRIDE + 2*i    ];
+                    cache_b.zw = buf_b[col * SHMEM_STRIDE + 2*i + 1];
+
+                    for (uint wsir = 0; wsir < WMITER; wsir++) {
+                        for (uint cr = 0; cr < TM / 2; cr++) {
+                            const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
+
+                            sums[sums_idx].x = fma(cache_a[wsir * TM + 2*cr    ].x, cache_b.x,
+                                               fma(cache_a[wsir * TM + 2*cr    ].y, cache_b.y,
+                                               fma(cache_a[wsir * TM + 2*cr    ].z, cache_b.z,
+                                               fma(cache_a[wsir * TM + 2*cr    ].w, cache_b.w, sums[sums_idx].x))));
+
+                            sums[sums_idx].y = fma(cache_a[wsir * TM + 2*cr + 1].x, cache_b.x,
+                                               fma(cache_a[wsir * TM + 2*cr + 1].y, cache_b.y,
+                                               fma(cache_a[wsir * TM + 2*cr + 1].z, cache_b.z,
+                                               fma(cache_a[wsir * TM + 2*cr + 1].w, cache_b.w, sums[sums_idx].y))));
+                        }
+                    }
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float * C = (device float *)dst + im * args.ne1 * args.ne0;
+
+    for (uint wsic = 0; wsic < WNITER; wsic++) {
+        for (uint wsir = 0; wsir < WMITER; wsir++) {
+            for (uint cc = 0; cc < TN; cc++) {
+                for (uint cr = 0; cr < TM / 2; cr++) {
+                    const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
+
+                    const uint dst_row0 = ir * BM + warp_r * WM + wsir * WSUBM + tiwr * TM + 2*cr;
+                    const uint dst_row1 = dst_row0 + 1;
+                    const uint dst_col  = ic * BN + warp_c * WN + wsic * WSUBN + tiwc * TN + cc;
+
+                    if (dst_row0 < args.ne0 && dst_col < args.ne1) {
+                        C[dst_col * args.ne0 + dst_row0] = sums[sums_idx].x;
+                    }
+                    if (dst_row1 < args.ne0 && dst_col < args.ne1) {
+                        C[dst_col * args.ne0 + dst_row1] = sums[sums_idx].y;
+                    }
+                }
+            }
+        }
+    }
+}
+
+template [[host_name("kernel_mul_mat_tiled_f16")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_f16>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+// ---------------------------------------------------------------------------
+// Quant A-matrix loaders for the tiled kernel (block-pointer style: byte
+// pointer, per-block K counter, dequant per element into shared memory).
+// All block structs / LUTs / QK constants come from ggml-common.h, which
+// master's monolithic ggml-metal.metal already includes.
+// ---------------------------------------------------------------------------
+
+// f32: typed pointer, element-based stride.
+inline void load_a_f32_to_shmem(
+    device const float * data_a,
+    threadgroup float2 * buf_a,
+    uint pos_a, uint loadr, uint loadc, uint idx_m, uint ne01,
+    uint block, uint end_k, uint stride_a
+) {
+    const uint idx = pos_a + loadc * stride_a + loadr * LOAD_VEC_A;
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_m < ne01 && block + loadr * LOAD_VEC_A + 1 < end_k) {
+        buf_a[buf_idx] = float2(data_a[idx], data_a[idx + 1]);
+    } else if (idx_m < ne01 && block + loadr * LOAD_VEC_A < end_k) {
+        buf_a[buf_idx] = float2(data_a[idx], 0.0f);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_f32 {
+    device const float * data_a;
+    uint stride_a;
+    uint pos_a;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        data_a = (device const float *)(src0 + offset0 + args.nb01 * (ir * BM));
+        stride_a = args.nb01 / sizeof(float);
+        pos_a = 0;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_f32_to_shmem(data_a, buf_a, pos_a, loadr, loadc, idx_m, ne01, block, end_k, stride_a);
+    }
+
+    void advance() { pos_a += BK; }
+};
+
+#if defined(GGML_METAL_HAS_BF16)
+inline void load_a_bf16_to_shmem(
+    device const bfloat * data_a,
+    threadgroup float2 * buf_a,
+    uint pos_a, uint loadr, uint loadc, uint idx_m, uint ne01,
+    uint block, uint end_k, uint stride_a
+) {
+    const uint idx = pos_a + loadc * stride_a + loadr * LOAD_VEC_A;
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_m < ne01 && block + loadr * LOAD_VEC_A + 1 < end_k) {
+        buf_a[buf_idx] = float2(float(data_a[idx]), float(data_a[idx + 1]));
+    } else if (idx_m < ne01 && block + loadr * LOAD_VEC_A < end_k) {
+        buf_a[buf_idx] = float2(float(data_a[idx]), 0.0f);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_bf16 {
+    device const bfloat * data_a;
+    uint stride_a;
+    uint pos_a;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        data_a = (device const bfloat *)(src0 + offset0 + args.nb01 * (ir * BM));
+        stride_a = args.nb01 / sizeof(bfloat);
+        pos_a = 0;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_bf16_to_shmem(data_a, buf_a, pos_a, loadr, loadc, idx_m, ne01, block, end_k, stride_a);
+    }
+
+    void advance() { pos_a += BK; }
+};
+#endif // GGML_METAL_HAS_BF16
+
+// mxfp4: byte pointer, block-based K tracking, LUT dequant scaled by e8m0.
+inline void load_a_mxfp4_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc, uint idx_m, uint ne01,
+    uint block_k, uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_m < ne01 && block_k < num_blocks) {
+        device const block_mxfp4 * block_ptr = (device const block_mxfp4 *)(src0_row + loadc * nb01) + block_k;
+
+        const float scale = e8m0_to_fp32(block_ptr->e);
+
+        if (loadr < 8) {
+            const uint8_t byte0 = block_ptr->qs[2*loadr];
+            const uint8_t byte1 = block_ptr->qs[2*loadr + 1];
+            buf_a[buf_idx] = float2(scale * kvalues_mxfp4_f[byte0 & 0x0F], scale * kvalues_mxfp4_f[byte1 & 0x0F]);
+        } else {
+            const uint8_t byte0 = block_ptr->qs[2*(loadr - 8)];
+            const uint8_t byte1 = block_ptr->qs[2*(loadr - 8) + 1];
+            buf_a[buf_idx] = float2(scale * kvalues_mxfp4_f[byte0 >> 4], scale * kvalues_mxfp4_f[byte1 >> 4]);
+        }
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_mxfp4 {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_k;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK_MXFP4;
+        block_k = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_mxfp4_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_k, num_blocks, nb01);
+    }
+
+    void advance() { block_k++; }
+};
+
+// q8_0: block pointer, scale-only dequant.
+inline void load_a_q8_0_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc, uint idx_m, uint ne01,
+    uint block_k, uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_m < ne01 && block_k < num_blocks) {
+        device const block_q8_0 * block_ptr = (device const block_q8_0 *)(src0_row + loadc * nb01) + block_k;
+
+        const float d = float(block_ptr->d);
+
+        const int8_t val0 = block_ptr->qs[loadr * 2];
+        const int8_t val1 = block_ptr->qs[loadr * 2 + 1];
+
+        buf_a[buf_idx] = float2(d * float(val0), d * float(val1));
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_q8_0 {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_k;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK8_0;
+        block_k = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_q8_0_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_k, num_blocks, nb01);
+    }
+
+    void advance() { block_k++; }
+};
+
+// q4_0: nibble packing, scale + offset dequant.
+inline void load_a_q4_0_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc, uint idx_m, uint ne01,
+    uint block_k, uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_m < ne01 && block_k < num_blocks) {
+        device const block_q4_0 * block_ptr = (device const block_q4_0 *)(src0_row + loadc * nb01) + block_k;
+
+        const float d = float(block_ptr->d);
+
+        if (loadr < 8) {
+            const uint8_t byte0 = block_ptr->qs[2*loadr];
+            const uint8_t byte1 = block_ptr->qs[2*loadr + 1];
+            const float val0 = d * float(byte0 & 0x0F) - 8.0f * d;
+            const float val1 = d * float(byte1 & 0x0F) - 8.0f * d;
+            buf_a[buf_idx] = float2(val0, val1);
+        } else {
+            const uint8_t byte0 = block_ptr->qs[2*(loadr - 8)];
+            const uint8_t byte1 = block_ptr->qs[2*(loadr - 8) + 1];
+            const float val0 = d * float(byte0 >> 4) - 8.0f * d;
+            const float val1 = d * float(byte1 >> 4) - 8.0f * d;
+            buf_a[buf_idx] = float2(val0, val1);
+        }
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_q4_0 {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_k;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK4_0;
+        block_k = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_q4_0_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_k, num_blocks, nb01);
+    }
+
+    void advance() { block_k++; }
+};
+
+// q4_1: nibble packing, scale + min dequant.
+inline void load_a_q4_1_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc, uint idx_m, uint ne01,
+    uint block_k, uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_m < ne01 && block_k < num_blocks) {
+        device const block_q4_1 * block_ptr = (device const block_q4_1 *)(src0_row + loadc * nb01) + block_k;
+
+        const float d = float(block_ptr->d);
+        const float m = float(block_ptr->m);
+
+        if (loadr < 8) {
+            const uint8_t byte0 = block_ptr->qs[2*loadr];
+            const uint8_t byte1 = block_ptr->qs[2*loadr + 1];
+            const float val0 = d * float(byte0 & 0x0F) + m;
+            const float val1 = d * float(byte1 & 0x0F) + m;
+            buf_a[buf_idx] = float2(val0, val1);
+        } else {
+            const uint8_t byte0 = block_ptr->qs[2*(loadr - 8)];
+            const uint8_t byte1 = block_ptr->qs[2*(loadr - 8) + 1];
+            const float val0 = d * float(byte0 >> 4) + m;
+            const float val1 = d * float(byte1 >> 4) + m;
+            buf_a[buf_idx] = float2(val0, val1);
+        }
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_q4_1 {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_k;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK4_1;
+        block_k = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_q4_1_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_k, num_blocks, nb01);
+    }
+
+    void advance() { block_k++; }
+};
+
+// q5_0: 5-bit values (high bit from qh), scale + offset dequant.
+inline void load_a_q5_0_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc, uint idx_m, uint ne01,
+    uint block_k, uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_m < ne01 && block_k < num_blocks) {
+        device const block_q5_0 * block_ptr = (device const block_q5_0 *)(src0_row + loadc * nb01) + block_k;
+
+        const float d = float(block_ptr->d);
+
+        const uint32_t qh32 = ((uint32_t)block_ptr->qh[0])
+                            | ((uint32_t)block_ptr->qh[1] << 8)
+                            | ((uint32_t)block_ptr->qh[2] << 16)
+                            | ((uint32_t)block_ptr->qh[3] << 24);
+
+        const uint elem0 = loadr * 2;
+        const uint elem1 = loadr * 2 + 1;
+
+        uint8_t nibble0, nibble1;
+        if (loadr < 8) {
+            nibble0 = block_ptr->qs[2*loadr] & 0x0F;
+            nibble1 = block_ptr->qs[2*loadr + 1] & 0x0F;
+        } else {
+            nibble0 = block_ptr->qs[2*(loadr - 8)] >> 4;
+            nibble1 = block_ptr->qs[2*(loadr - 8) + 1] >> 4;
+        }
+
+        const uint8_t bit5_0 = (qh32 >> elem0) & 1;
+        const uint8_t bit5_1 = (qh32 >> elem1) & 1;
+
+        const uint8_t val5bit_0 = nibble0 | (bit5_0 << 4);
+        const uint8_t val5bit_1 = nibble1 | (bit5_1 << 4);
+
+        const float val0 = d * float(val5bit_0) - 16.0f * d;
+        const float val1 = d * float(val5bit_1) - 16.0f * d;
+
+        buf_a[buf_idx] = float2(val0, val1);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_q5_0 {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_k;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK5_0;
+        block_k = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_q5_0_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_k, num_blocks, nb01);
+    }
+
+    void advance() { block_k++; }
+};
+
+// q5_1: 5-bit values (high bit from qh), scale + min dequant.
+inline void load_a_q5_1_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc, uint idx_m, uint ne01,
+    uint block_k, uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_m < ne01 && block_k < num_blocks) {
+        device const block_q5_1 * block_ptr = (device const block_q5_1 *)(src0_row + loadc * nb01) + block_k;
+
+        const float d = float(block_ptr->d);
+        const float m = float(block_ptr->m);
+
+        const uint32_t qh32 = ((uint32_t)block_ptr->qh[0])
+                            | ((uint32_t)block_ptr->qh[1] << 8)
+                            | ((uint32_t)block_ptr->qh[2] << 16)
+                            | ((uint32_t)block_ptr->qh[3] << 24);
+
+        const uint elem0 = loadr * 2;
+        const uint elem1 = loadr * 2 + 1;
+
+        uint8_t nibble0, nibble1;
+        if (loadr < 8) {
+            nibble0 = block_ptr->qs[2*loadr] & 0x0F;
+            nibble1 = block_ptr->qs[2*loadr + 1] & 0x0F;
+        } else {
+            nibble0 = block_ptr->qs[2*(loadr - 8)] >> 4;
+            nibble1 = block_ptr->qs[2*(loadr - 8) + 1] >> 4;
+        }
+
+        const uint8_t bit5_0 = (qh32 >> elem0) & 1;
+        const uint8_t bit5_1 = (qh32 >> elem1) & 1;
+
+        const uint8_t val5bit_0 = nibble0 | (bit5_0 << 4);
+        const uint8_t val5bit_1 = nibble1 | (bit5_1 << 4);
+
+        const float val0 = d * float(val5bit_0) + m;
+        const float val1 = d * float(val5bit_1) + m;
+
+        buf_a[buf_idx] = float2(val0, val1);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_q5_1 {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_k;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK5_1;
+        block_k = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_q5_1_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_k, num_blocks, nb01);
+    }
+
+    void advance() { block_k++; }
+};
+
+// iq4_nl: nibble packing with LUT dequant.
+inline void load_a_iq4_nl_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc, uint idx_m, uint ne01,
+    uint block_k, uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_m < ne01 && block_k < num_blocks) {
+        device const block_iq4_nl * block_ptr = (device const block_iq4_nl *)(src0_row + loadc * nb01) + block_k;
+
+        const float d = float(block_ptr->d);
+
+        if (loadr < 8) {
+            const uint8_t byte0 = block_ptr->qs[2*loadr];
+            const uint8_t byte1 = block_ptr->qs[2*loadr + 1];
+            const float val0 = d * kvalues_iq4nl_f[byte0 & 0x0F];
+            const float val1 = d * kvalues_iq4nl_f[byte1 & 0x0F];
+            buf_a[buf_idx] = float2(val0, val1);
+        } else {
+            const uint8_t byte0 = block_ptr->qs[2*(loadr - 8)];
+            const uint8_t byte1 = block_ptr->qs[2*(loadr - 8) + 1];
+            const float val0 = d * kvalues_iq4nl_f[byte0 >> 4];
+            const float val1 = d * kvalues_iq4nl_f[byte1 >> 4];
+            buf_a[buf_idx] = float2(val0, val1);
+        }
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_iq4_nl {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_k;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK4_NL;
+        block_k = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_iq4_nl_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_k, num_blocks, nb01);
+    }
+
+    void advance() { block_k++; }
+};
+
+template [[host_name("kernel_mul_mat_tiled_f32")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_f32>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_mul_mat_tiled_bf16")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_bf16>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+#endif
+
+template [[host_name("kernel_mul_mat_tiled_mxfp4")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_mxfp4>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_q8_0")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q8_0>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_q4_0")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q4_0>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_q4_1")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q4_1>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_q5_0")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q5_0>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_q5_1")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q5_1>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_iq4_nl")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_iq4_nl>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+// ---------------------------------------------------------------------------
+// k-quant A-matrix loaders (QK_K=256). One block spans 8 K-tiles (256/32),
+// tracked via block_idx + sub_block. Uses master's get_scale_min_k4_just2.
+// ---------------------------------------------------------------------------
+
+// q4_K
+inline void load_a_q4_K_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc, uint idx_m, uint ne01,
+    uint block_idx, uint sub_block, uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_m < ne01 && block_idx < num_blocks) {
+        device const block_q4_K * block_ptr = (device const block_q4_K *)(src0_row + loadc * nb01) + block_idx;
+
+        const uint qs_base = (sub_block / 2) * 32;
+        const bool use_high = (sub_block % 2) == 1;
+        const uint is = (sub_block / 2) * 2;
+        const uint sc_k = use_high ? 1 : 0;
+        const uchar2 sc = get_scale_min_k4_just2(is, sc_k, block_ptr->scales);
+        const float d = use_high ? (float)block_ptr->d / 16.0f : (float)block_ptr->d;
+        const float min_val = (float)block_ptr->dmin;
+        const float dl = d * sc[0];
+        const float ml = min_val * sc[1];
+
+        device const uint8_t * qs = block_ptr->qs + qs_base;
+
+        uint8_t byte0, byte1;
+        if (loadr < 8) {
+            byte0 = qs[2 * loadr];
+            byte1 = qs[2 * loadr + 1];
+        } else {
+            byte0 = qs[16 + 2 * (loadr - 8)];
+            byte1 = qs[16 + 2 * (loadr - 8) + 1];
+        }
+
+        float val0, val1;
+        if (use_high) {
+            val0 = dl * float(byte0 & 0xF0) - ml;
+            val1 = dl * float(byte1 & 0xF0) - ml;
+        } else {
+            val0 = dl * float(byte0 & 0x0F) - ml;
+            val1 = dl * float(byte1 & 0x0F) - ml;
+        }
+
+        buf_a[buf_idx] = float2(val0, val1);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_q4_K {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_idx;
+    uint sub_block;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK_K;
+        block_idx = 0;
+        sub_block = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_q4_K_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01,
+                             block_idx, sub_block, num_blocks, nb01);
+    }
+
+    void advance() {
+        sub_block++;
+        if (sub_block == 8) { sub_block = 0; block_idx++; }
+    }
+};
+
+// q5_K
+inline void load_a_q5_K_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc, uint idx_m, uint ne01,
+    uint block_idx, uint sub_block, uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_m < ne01 && block_idx < num_blocks) {
+        device const block_q5_K * block_ptr = (device const block_q5_K *)(src0_row + loadc * nb01) + block_idx;
+
+        const uint qs_base = (sub_block / 2) * 32;
+        const bool use_high = (sub_block % 2) == 1;
+        const uint is = (sub_block / 2) * 2;
+        const uint sc_k = use_high ? 1 : 0;
+        const uchar2 sc = get_scale_min_k4_just2(is, sc_k, block_ptr->scales);
+        const float d = use_high ? (float)block_ptr->d / 16.0f : (float)block_ptr->d;
+        const float min_val = (float)block_ptr->dmin;
+        const float dl = d * sc[0];
+        const float ml = min_val * sc[1];
+
+        const uint8_t ul = 1 << sub_block;
+        const float qh_val = use_high ? 256.0f : 16.0f;
+
+        device const uint8_t * qs = block_ptr->qs + qs_base;
+        device const uint8_t * qh = block_ptr->qh;
+
+        uint qh_byte_idx0, qh_byte_idx1;
+        uint8_t byte0, byte1;
+        if (loadr < 8) {
+            byte0 = qs[2 * loadr];
+            byte1 = qs[2 * loadr + 1];
+            qh_byte_idx0 = 2 * loadr;
+            qh_byte_idx1 = 2 * loadr + 1;
+        } else {
+            byte0 = qs[16 + 2 * (loadr - 8)];
+            byte1 = qs[16 + 2 * (loadr - 8) + 1];
+            qh_byte_idx0 = 16 + 2 * (loadr - 8);
+            qh_byte_idx1 = 16 + 2 * (loadr - 8) + 1;
+        }
+
+        const uint8_t qh0 = qh[qh_byte_idx0];
+        const uint8_t qh1 = qh[qh_byte_idx1];
+        const float extra0 = (qh0 & ul) ? qh_val : 0.0f;
+        const float extra1 = (qh1 & ul) ? qh_val : 0.0f;
+
+        float val0, val1;
+        if (use_high) {
+            val0 = dl * (float(byte0 & 0xF0) + extra0) - ml;
+            val1 = dl * (float(byte1 & 0xF0) + extra1) - ml;
+        } else {
+            val0 = dl * (float(byte0 & 0x0F) + extra0) - ml;
+            val1 = dl * (float(byte1 & 0x0F) + extra1) - ml;
+        }
+
+        buf_a[buf_idx] = float2(val0, val1);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_q5_K {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_idx;
+    uint sub_block;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK_K;
+        block_idx = 0;
+        sub_block = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_q5_K_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01,
+                             block_idx, sub_block, num_blocks, nb01);
+    }
+
+    void advance() {
+        sub_block++;
+        if (sub_block == 8) { sub_block = 0; block_idx++; }
+    }
+};
+
+// q6_K
+inline void load_a_q6_K_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc, uint idx_m, uint ne01,
+    uint block_idx, uint sub_block, uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_m < ne01 && block_idx < num_blocks) {
+        device const block_q6_K * block_ptr = (device const block_q6_K *)(src0_row + loadc * nb01) + block_idx;
+
+        const float d = (float)block_ptr->d;
+
+        // Canonical ggml q6_K layout (dequantize_row_q6_K): QK_K=256 split into two
+        // halves of 128 elements; each half: ql[64], qh[32], scales[8]. Within a half,
+        // position p (0..127) decomposes as group g = p/32 (0..3), l = p%32, is = l/16.
+        // Element e -> half = e/128, p = e%128. For (sub_block, loadr):
+        //   e0 = sub_block*32 + loadr*2  =>  half = sub_block/4, g = sub_block%4, l = loadr*2
+        const uint half_i = sub_block / 4;
+        const uint g      = sub_block % 4;
+        const uint l0     = loadr * 2;        // 0,2,..,30
+        const uint l1     = loadr * 2 + 1;    // 1,3,..,31
+
+        device const uint8_t * ql = (device const uint8_t *)block_ptr->ql + half_i * 64;
+        device const uint8_t * qh = (device const uint8_t *)block_ptr->qh + half_i * 32;
+        device const int8_t  * sc = (device const int8_t  *)block_ptr->scales + half_i * 8;
+
+        const float scale0 = (float)sc[(l0 / 16) + 2 * g];
+        const float scale1 = (float)sc[(l1 / 16) + 2 * g];
+
+        int q0, q1;
+        if (g == 0) {
+            q0 = (int)((ql[l0]      & 0x0F) | (((qh[l0] >> 0) & 3) << 4)) - 32;
+            q1 = (int)((ql[l1]      & 0x0F) | (((qh[l1] >> 0) & 3) << 4)) - 32;
+        } else if (g == 1) {
+            q0 = (int)((ql[l0 + 32] & 0x0F) | (((qh[l0] >> 2) & 3) << 4)) - 32;
+            q1 = (int)((ql[l1 + 32] & 0x0F) | (((qh[l1] >> 2) & 3) << 4)) - 32;
+        } else if (g == 2) {
+            q0 = (int)((ql[l0]      >>   4) | (((qh[l0] >> 4) & 3) << 4)) - 32;
+            q1 = (int)((ql[l1]      >>   4) | (((qh[l1] >> 4) & 3) << 4)) - 32;
+        } else {
+            q0 = (int)((ql[l0 + 32] >>   4) | (((qh[l0] >> 6) & 3) << 4)) - 32;
+            q1 = (int)((ql[l1 + 32] >>   4) | (((qh[l1] >> 6) & 3) << 4)) - 32;
+        }
+
+        buf_a[buf_idx] = float2(d * scale0 * float(q0), d * scale1 * float(q1));
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_q6_K {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_idx;
+    uint sub_block;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK_K;
+        block_idx = 0;
+        sub_block = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_q6_K_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01,
+                             block_idx, sub_block, num_blocks, nb01);
+    }
+
+    void advance() {
+        sub_block++;
+        if (sub_block == 8) { sub_block = 0; block_idx++; }
+    }
+};
+
+// q2_K
+inline void load_a_q2_K_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc, uint idx_m, uint ne01,
+    uint block_idx, uint sub_block, uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_m < ne01 && block_idx < num_blocks) {
+        device const block_q2_K * block_ptr = (device const block_q2_K *)(src0_row + loadc * nb01) + block_idx;
+
+        const float d = (float)block_ptr->d;
+        const float min_val = (float)block_ptr->dmin;
+
+        const uint il_base = sub_block * 2;
+        const bool second_half = (loadr >= 8);
+        const uint il = il_base + (second_half ? 1 : 0);
+
+        device const uint8_t * q = (device const uint8_t *)block_ptr->qs;
+        q = q + 32 * (il / 8) + 16 * (il & 1);
+
+        const uint8_t sc = block_ptr->scales[il];
+
+        const uint il_mod = (il / 2) % 4;
+        half coef;
+        uchar mask;
+        if (il_mod == 0) {
+            coef = 1.h; mask = 3;
+        } else if (il_mod == 1) {
+            coef = 1 / 4.h; mask = 12;
+        } else if (il_mod == 2) {
+            coef = 1 / 16.h; mask = 48;
+        } else {
+            coef = 1 / 64.h; mask = 192;
+        }
+
+        const float dl = d * (sc & 0xF) * (float)coef;
+        const float ml = min_val * (sc >> 4);
+
+        const uint local_idx = second_half ? (loadr - 8) : loadr;
+        const uint8_t byte0 = q[2 * local_idx];
+        const uint8_t byte1 = q[2 * local_idx + 1];
+
+        const float val0 = dl * float(byte0 & mask) - ml;
+        const float val1 = dl * float(byte1 & mask) - ml;
+
+        buf_a[buf_idx] = float2(val0, val1);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_q2_K {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_idx;
+    uint sub_block;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK_K;
+        block_idx = 0;
+        sub_block = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_q2_K_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01,
+                             block_idx, sub_block, num_blocks, nb01);
+    }
+
+    void advance() {
+        sub_block++;
+        if (sub_block == 8) { sub_block = 0; block_idx++; }
+    }
+};
+
+// q3_K (follows dequantize_q3_K exactly)
+inline void load_a_q3_K_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc, uint idx_m, uint ne01,
+    uint block_idx, uint sub_block, uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_m < ne01 && block_idx < num_blocks) {
+        device const block_q3_K * block_ptr = (device const block_q3_K *)(src0_row + loadc * nb01) + block_idx;
+
+        const float d_all = (float)block_ptr->d;
+        device const uint8_t * q_base = (device const uint8_t *)block_ptr->qs;
+        device const uint8_t * h_base = (device const uint8_t *)block_ptr->hmask;
+        device const int8_t * scales = (device const int8_t *)block_ptr->scales;
+
+        const uint il = sub_block * 2 + (loadr >= 8 ? 1 : 0);
+        const uint local_idx = loadr % 8;
+
+        device const uint8_t * q = q_base + 32 * (il/8) + 16 * (il&1);
+        device const uint8_t * h = h_base + 16 * (il&1);
+        const uint8_t m = 1 << (il/2);
+
+        uint16_t kmask1 = (il/4)>1 ? ((il/4)>2 ? 192 : 48) : ((il/4)>0 ? 12 : 3);
+        uint16_t kmask2 = il/8 ? 0xF0 : 0x0F;
+        uint16_t scale_2 = uint16_t(uint8_t(scales[il%8]));
+        uint16_t scale_1 = uint16_t(uint8_t(scales[8 + il%4]));
+        int16_t  dl_int = (il/4)&1 ? (scale_2&kmask2) | ((scale_1&kmask1) << 2)
+                                   : (scale_2&kmask2) | ((scale_1&kmask1) << 4);
+        float dl = il<8 ? d_all * (float(dl_int) - 32.f) : d_all * (float(dl_int) / 16.f - 32.f);
+        const float ml = 4.f * dl;
+
+        uint il2 = (il/2) & 3;
+        float coef = il2>1 ? (il2>2 ? 1.0f/64.f : 1.0f/16.f) : (il2>0 ? 1.0f/4.f : 1.0f);
+        uint8_t mask = il2>1 ? (il2>2 ? 192 : 48) : (il2>0 ? 12 : 3);
+        dl *= coef;
+
+        uint i0 = local_idx * 2;
+        uint i1 = i0 + 1;
+        float val0 = dl * float(q[i0] & mask) - (h[i0] & m ? 0.f : ml);
+        float val1 = dl * float(q[i1] & mask) - (h[i1] & m ? 0.f : ml);
+
+        buf_a[buf_idx] = float2(val0, val1);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_q3_K {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_idx;
+    uint sub_block;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK_K;
+        block_idx = 0;
+        sub_block = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_q3_K_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01,
+                             block_idx, sub_block, num_blocks, nb01);
+    }
+
+    void advance() {
+        sub_block++;
+        if (sub_block == 8) { sub_block = 0; block_idx++; }
+    }
+};
+
+template [[host_name("kernel_mul_mat_tiled_q4_K")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q4_K>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_q5_K")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q5_K>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_q6_K")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q6_K>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_q2_K")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q2_K>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_q3_K")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q3_K>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+// ============================================================================
+// iq4_xs — 4-bit importance quantization with per-sub-block scales
+// ============================================================================
+
+inline void load_a_iq4_xs_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc,
+    uint idx_m, uint ne01,
+    uint block_idx, uint sub_block,
+    uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+    if (idx_m < ne01 && block_idx < num_blocks) {
+        device const block_iq4_xs * block_ptr = (device const block_iq4_xs *)(src0_row + loadc * nb01) + block_idx;
+
+        const int ls = ((block_ptr->scales_l[sub_block/2] >> 4*(sub_block%2)) & 0xf) |
+                       (((block_ptr->scales_h >> 2*sub_block) & 3) << 4);
+        const float d = (float)block_ptr->d * (ls - 32);
+
+        device const uint8_t * qs = block_ptr->qs + 16 * sub_block;
+
+        if (loadr < 8) {
+            const uint8_t byte0 = qs[2*loadr];
+            const uint8_t byte1 = qs[2*loadr + 1];
+            buf_a[buf_idx] = float2(d * kvalues_iq4nl_f[byte0 & 0x0F], d * kvalues_iq4nl_f[byte1 & 0x0F]);
+        } else {
+            const uint8_t byte0 = qs[2*(loadr - 8)];
+            const uint8_t byte1 = qs[2*(loadr - 8) + 1];
+            buf_a[buf_idx] = float2(d * kvalues_iq4nl_f[byte0 >> 4], d * kvalues_iq4nl_f[byte1 >> 4]);
+        }
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_iq4_xs {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_idx;
+    uint sub_block;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK_K;
+        block_idx = 0;
+        sub_block = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_iq4_xs_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
+    }
+
+    void advance() {
+        sub_block++;
+        if (sub_block == 8) {
+            sub_block = 0;
+            block_idx++;
+        }
+    }
+};
+
+// ============================================================================
+// iq2_xxs — 2-bit importance quantization (xxs variant)
+// ============================================================================
+
+inline void load_a_iq2_xxs_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc,
+    uint idx_m, uint ne01,
+    uint block_idx, uint sub_block,
+    uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+    if (idx_m < ne01 && block_idx < num_blocks) {
+        device const block_iq2_xxs * block_ptr = (device const block_iq2_xxs *)(src0_row + loadc * nb01) + block_idx;
+
+        device const uint16_t * q2 = block_ptr->qs + 4 * sub_block;
+        const uint32_t aux32_g = q2[0] | (q2[1] << 16);
+        const uint32_t aux32_s = q2[2] | (q2[3] << 16);
+        thread const uint8_t * aux8 = (thread const uint8_t *)&aux32_g;
+
+        const float dl = (float)block_ptr->d * (0.5f + (aux32_s >> 28)) * 0.25f;
+
+        const uint elem0 = loadr * 2;
+        const uint group = elem0 / 8;
+
+        constant uint8_t * grid = (constant uint8_t *)(iq2xxs_grid + aux8[group]);
+        const uint sign_shift = group * 7;
+        const uint8_t signs = ksigns_iq2xs[(aux32_s >> sign_shift) & 127];
+
+        const uint pos0 = elem0 % 8;
+        const uint pos1 = (elem0 + 1) % 8;
+
+        const float val0 = dl * grid[pos0] * (signs & kmask_iq2xs[pos0] ? -1.f : 1.f);
+        const float val1 = dl * grid[pos1] * (signs & kmask_iq2xs[pos1] ? -1.f : 1.f);
+
+        buf_a[buf_idx] = float2(val0, val1);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_iq2_xxs {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_idx;
+    uint sub_block;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK_K;
+        block_idx = 0;
+        sub_block = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_iq2_xxs_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
+    }
+
+    void advance() {
+        sub_block++;
+        if (sub_block == 8) {
+            sub_block = 0;
+            block_idx++;
+        }
+    }
+};
+
+// ============================================================================
+// iq2_xs — 2-bit importance quantization (xs variant, with per-sub-block scales)
+// ============================================================================
+
+inline void load_a_iq2_xs_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc,
+    uint idx_m, uint ne01,
+    uint block_idx, uint sub_block,
+    uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+    if (idx_m < ne01 && block_idx < num_blocks) {
+        device const block_iq2_xs * block_ptr = (device const block_iq2_xs *)(src0_row + loadc * nb01) + block_idx;
+
+        const uint elem0 = loadr * 2;
+        const uint il_half = elem0 / 16;
+
+        const float d = (float)block_ptr->d;
+        const float dl = d * (0.5f + ((block_ptr->scales[sub_block] >> 4*il_half) & 0xf)) * 0.25f;
+
+        const uint q2_idx = elem0 / 8;
+        device const uint16_t * q2 = block_ptr->qs + 4 * sub_block;
+
+        constant uint8_t * grid = (constant uint8_t *)(iq2xs_grid + (q2[q2_idx] & 511));
+        const uint8_t signs = ksigns_iq2xs[q2[q2_idx] >> 9];
+
+        const uint pos0 = elem0 % 8;
+        const uint pos1 = (elem0 + 1) % 8;
+
+        const float val0 = dl * grid[pos0] * (signs & kmask_iq2xs[pos0] ? -1.f : 1.f);
+        const float val1 = dl * grid[pos1] * (signs & kmask_iq2xs[pos1] ? -1.f : 1.f);
+
+        buf_a[buf_idx] = float2(val0, val1);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_iq2_xs {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_idx;
+    uint sub_block;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK_K;
+        block_idx = 0;
+        sub_block = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_iq2_xs_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
+    }
+
+    void advance() {
+        sub_block++;
+        if (sub_block == 8) {
+            sub_block = 0;
+            block_idx++;
+        }
+    }
+};
+
+// ============================================================================
+// iq2_s — 2-bit importance quantization (s variant, with separate signs)
+// ============================================================================
+
+inline void load_a_iq2_s_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc,
+    uint idx_m, uint ne01,
+    uint block_idx, uint sub_block,
+    uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+    if (idx_m < ne01 && block_idx < num_blocks) {
+        device const block_iq2_s * block_ptr = (device const block_iq2_s *)(src0_row + loadc * nb01) + block_idx;
+
+        const uint elem0 = loadr * 2;
+        const uint il_half = elem0 / 16;
+
+        const float d = (float)block_ptr->d;
+        const float dl = d * (0.5f + ((block_ptr->scales[sub_block] >> 4*il_half) & 0xf)) * 0.25f;
+
+        device const uint8_t * qs = block_ptr->qs + 4 * sub_block + 2 * il_half;
+        device const uint8_t * signs = qs + QK_K/8;
+        const uint8_t qh = block_ptr->qh[sub_block] >> 4*il_half;
+
+        const uint group8 = elem0 / 8;
+        const uint local_group = group8 % 2;
+
+        constant uint8_t * grid = (constant uint8_t *)(iq2s_grid + (qs[local_group] | ((qh << (8-2*local_group)) & 0x300)));
+
+        const uint pos0 = elem0 % 8;
+        const uint pos1 = (elem0 + 1) % 8;
+
+        const float val0 = dl * grid[pos0] * select(1.f, -1.f, signs[local_group] & kmask_iq2xs[pos0]);
+        const float val1 = dl * grid[pos1] * select(1.f, -1.f, signs[local_group] & kmask_iq2xs[pos1]);
+
+        buf_a[buf_idx] = float2(val0, val1);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_iq2_s {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_idx;
+    uint sub_block;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK_K;
+        block_idx = 0;
+        sub_block = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_iq2_s_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
+    }
+
+    void advance() {
+        sub_block++;
+        if (sub_block == 8) {
+            sub_block = 0;
+            block_idx++;
+        }
+    }
+};
+
+// ============================================================================
+// iq3_xxs — 3-bit importance quantization (xxs variant)
+// ============================================================================
+
+inline void load_a_iq3_xxs_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc,
+    uint idx_m, uint ne01,
+    uint block_idx, uint sub_block,
+    uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+    if (idx_m < ne01 && block_idx < num_blocks) {
+        device const block_iq3_xxs * block_ptr = (device const block_iq3_xxs *)(src0_row + loadc * nb01) + block_idx;
+
+        device const uint8_t * q3 = block_ptr->qs + 8 * sub_block;
+        device const uint16_t * gas = (device const uint16_t *)(block_ptr->qs + QK_K/4) + 2 * sub_block;
+        const uint32_t aux32 = gas[0] | (gas[1] << 16);
+
+        const float d = (float)block_ptr->d;
+        const float dl = d * (0.5f + (aux32 >> 28)) * 0.5f;
+
+        const uint elem0 = loadr * 2;
+        const uint il_half = elem0 / 16;
+        const uint local_group = (elem0 % 16) / 4;
+        const uint q3_idx = 4 * il_half + local_group;
+
+        constant uint8_t * grid = (constant uint8_t *)(iq3xxs_grid + q3[q3_idx]);
+
+        const uint sign_shift = (local_group < 2) ? (14 * il_half) : (14 * il_half + 7);
+        const uint8_t signs = ksigns_iq2xs[(aux32 >> sign_shift) & 127];
+
+        const uint kmask_base = (local_group % 2) * 4;
+        const uint pos0 = elem0 % 4;
+        const uint pos1 = (elem0 + 1) % 4;
+
+        const float val0 = dl * grid[pos0] * (signs & kmask_iq2xs[kmask_base + pos0] ? -1.f : 1.f);
+        const float val1 = dl * grid[pos1] * (signs & kmask_iq2xs[kmask_base + pos1] ? -1.f : 1.f);
+
+        buf_a[buf_idx] = float2(val0, val1);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_iq3_xxs {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_idx;
+    uint sub_block;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK_K;
+        block_idx = 0;
+        sub_block = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_iq3_xxs_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
+    }
+
+    void advance() {
+        sub_block++;
+        if (sub_block == 8) {
+            sub_block = 0;
+            block_idx++;
+        }
+    }
+};
+
+// ============================================================================
+// iq3_s — 3-bit importance quantization (s variant, with separate signs and qh)
+// ============================================================================
+
+// iq3_s: 4 grids per half (grid0..3), each grid has 4 values. signs are per 4-element group.
+// Reference: dequantize_iq3_s in dequant.metal
+inline void load_a_iq3_s_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc,
+    uint idx_m, uint ne01,
+    uint block_idx, uint sub_block,
+    uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+    if (idx_m < ne01 && block_idx < num_blocks) {
+        device const block_iq3_s * block_ptr = (device const block_iq3_s *)(src0_row + loadc * nb01) + block_idx;
+
+        const float d = (float)block_ptr->d;
+        const float dl = d * (1 + 2*((block_ptr->scales[sub_block/2] >> 4*(sub_block%2)) & 0xf));
+
+        device const uint8_t * qs = block_ptr->qs + 8 * sub_block;
+        const uint8_t qh_byte = block_ptr->qh[sub_block];
+        device const uint8_t * signs = block_ptr->signs + 4 * sub_block;
+
+        const uint elem0 = loadr * 2;
+        const uint il = elem0 / 16;  // 0 or 1 — which half
+        const uint local_group = (elem0 % 16) / 4;  // 0..3 within half
+        const uint q3_idx = 4 * il + local_group;
+
+        // qh shifts: 8, 7, 6, 5 for qs indices 0, 1, 2, 3 within each half
+        // Reference: grid1 = qs[4*il+0] | ((qh << 8) & 256)
+        //            grid2 = qs[4*il+1] | ((qh << 7) & 256)  etc.
+        const uint8_t qh_shifted = (il == 0) ? qh_byte : (qh_byte >> 4);
+        const uint qh_shift = 8 - local_group;
+        constant uint8_t * grid = (constant uint8_t *)(iq3s_grid + (qs[q3_idx] | ((qh_shifted << qh_shift) & 256)));
+
+        const uint pos0 = elem0 % 4;
+        const uint pos1 = (elem0 + 1) % 4;
+
+        // Signs: signs[2*il + 0] for groups 0,1; signs[2*il + 1] for groups 2,3
+        // kmask_iq2xs[0..3] for first grid, kmask_iq2xs[4..7] for second
+        const uint sign_byte_idx = 2 * il + local_group / 2;
+        const uint kmask_base = (local_group % 2) * 4;
+
+        const float val0 = dl * grid[pos0] * select(1.f, -1.f, signs[sign_byte_idx] & kmask_iq2xs[kmask_base + pos0]);
+        const float val1 = dl * grid[pos1] * select(1.f, -1.f, signs[sign_byte_idx] & kmask_iq2xs[kmask_base + pos1]);
+
+        buf_a[buf_idx] = float2(val0, val1);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_iq3_s {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_idx;
+    uint sub_block;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK_K;
+        block_idx = 0;
+        sub_block = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_iq3_s_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
+    }
+
+    void advance() {
+        sub_block++;
+        if (sub_block == 8) {
+            sub_block = 0;
+            block_idx++;
+        }
+    }
+};
+
+// ============================================================================
+// iq1_s — 1-bit importance quantization (s variant)
+// ============================================================================
+
+// iq1_s: type4x4 layout = [grid_lo[0..3], grid_hi[0..3], grid2_lo[0..3], grid2_hi[0..3]]
+// Reference: dequantize_iq1_s in dequant.metal
+inline void load_a_iq1_s_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc,
+    uint idx_m, uint ne01,
+    uint block_idx, uint sub_block,
+    uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+    if (idx_m < ne01 && block_idx < num_blocks) {
+        device const block_iq1_s * block_ptr = (device const block_iq1_s *)(src0_row + loadc * nb01) + block_idx;
+
+        const float d = (float)block_ptr->d;
+        device const uint16_t * qh = block_ptr->qh;
+
+        const float dl = d * (2*((qh[sub_block] >> 12) & 7) + 1);
+        const float ml = dl * (qh[sub_block] & 0x8000 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA);
+
+        const uint elem0 = loadr * 2;
+        const uint il_half = elem0 / 16;
+        const uint16_t h = qh[sub_block] >> 6*il_half;
+
+        device const uint8_t * qs = block_ptr->qs + 4 * sub_block + 2 * il_half;
+
+        // grid1 = qs[0], shift <<8; grid2 = qs[1], shift <<5
+        const uint local_group = (elem0 / 8) % 2;
+        constant uint8_t * grid = (constant uint8_t *)(iq1s_grid_gpu + (qs[local_group] | ((h << (8-3*local_group)) & 0x700)));
+
+        // type4x4: elements 0-3 = grid[0..3] & 0xf, elements 4-7 = grid[0..3] >> 4
+        const uint pos = elem0 % 8;
+        const uint byte0 = pos % 4;
+        const bool high0 = pos >= 4;
+        const float val0 = dl * (high0 ? (grid[byte0] >> 4) : (grid[byte0] & 0xf)) + ml;
+
+        const uint pos1 = (elem0 + 1) % 8;
+        const uint byte1 = pos1 % 4;
+        const bool high1 = pos1 >= 4;
+        const float val1 = dl * (high1 ? (grid[byte1] >> 4) : (grid[byte1] & 0xf)) + ml;
+
+        buf_a[buf_idx] = float2(val0, val1);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_iq1_s {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_idx;
+    uint sub_block;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK_K;
+        block_idx = 0;
+        sub_block = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_iq1_s_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
+    }
+
+    void advance() {
+        sub_block++;
+        if (sub_block == 8) {
+            sub_block = 0;
+            block_idx++;
+        }
+    }
+};
+
+// ============================================================================
+// iq1_m — 1-bit importance quantization (m variant, with per-grid deltas)
+// ============================================================================
+
+// iq1_m: no .d field, scale reconstructed from scales[] nibbles, qh is uint8_t
+// Reference: dequantize_iq1_m in dequant.metal
+inline void load_a_iq1_m_to_shmem(
+    device const char * src0_row,
+    threadgroup float2 * buf_a,
+    uint loadr, uint loadc,
+    uint idx_m, uint ne01,
+    uint block_idx, uint sub_block,
+    uint num_blocks, uint nb01
+) {
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+    if (idx_m < ne01 && block_idx < num_blocks) {
+        device const block_iq1_m * block_ptr = (device const block_iq1_m *)(src0_row + loadc * nb01) + block_idx;
+
+        // Reconstruct d from scales[] — iq1_m has no .d field
+        device const uint16_t * sc = (device const uint16_t *)block_ptr->scales;
+        iq1m_scale_t scale;
+        scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+        const float d = scale.f16;
+
+        // sub_block = ib32 (0..7), each covers 32 elements
+        const uint elem0 = loadr * 2;
+        const uint il = elem0 / 16;  // 0 or 1 — which half of the 32-element sub-block
+
+        device const uint8_t * qs = block_ptr->qs + 4 * sub_block + 2 * il;
+        device const uint8_t * qh = block_ptr->qh + 2 * sub_block + il;
+
+        const float dl = d * (2*((sc[sub_block/2] >> (6*(sub_block%2) + 3*il)) & 7) + 1);
+
+        // Two groups of 8 per half: group0 uses qs[0]/ml1, group1 uses qs[1]/ml2
+        const uint group8 = elem0 / 8;
+        const uint local_group = group8 % 2;
+
+        // ml differs per group: bit 3 for group0, bit 7 for group1
+        const float ml = dl * (qh[0] & (local_group == 0 ? 0x08 : 0x80) ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA);
+
+        // Grid shifts: <<8 for group0, <<4 for group1 (differs from iq1_s which uses <<8/<<5)
+        constant uint8_t * grid = (constant uint8_t *)(iq1s_grid_gpu + (qs[local_group] | ((qh[0] << (8 - 4*local_group)) & 0x700)));
+
+        // type4x4: elements 0-3 = grid[0..3] & 0xf, elements 4-7 = grid[0..3] >> 4
+        const uint pos = elem0 % 8;
+        const uint byte0 = pos % 4;
+        const bool high0 = pos >= 4;
+        const float val0 = dl * (high0 ? (grid[byte0] >> 4) : (grid[byte0] & 0xf)) + ml;
+
+        const uint pos1 = (elem0 + 1) % 8;
+        const uint byte1 = pos1 % 4;
+        const bool high1 = pos1 >= 4;
+        const float val1 = dl * (high1 ? (grid[byte1] >> 4) : (grid[byte1] & 0xf)) + ml;
+
+        buf_a[buf_idx] = float2(val0, val1);
+    } else {
+        buf_a[buf_idx] = float2(0.0f);
+    }
+}
+
+struct tiled_loader_iq1_m {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_idx;
+    uint sub_block;
+    uint nb01;
+
+    template <typename Args>
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant Args & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK_K;
+        block_idx = 0;
+        sub_block = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_iq1_m_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
+    }
+
+    void advance() {
+        sub_block++;
+        if (sub_block == 8) {
+            sub_block = 0;
+            block_idx++;
+        }
+    }
+};
+template [[host_name("kernel_mul_mat_tiled_iq4_xs")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_iq4_xs>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_iq2_xxs")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_iq2_xxs>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_iq2_xs")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_iq2_xs>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_iq2_s")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_iq2_s>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_iq3_xxs")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_iq3_xxs>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_iq3_s")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_iq3_s>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_iq1_s")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_iq1_s>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_iq1_m")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_iq1_m>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+// Tiled mul_mat_id (MoE) for GPUs without simdgroup_mm: same GEMM body as
+// kernel_mul_mat_tiled_impl, but N is the tokens routed to one expert. tgpig.z
+// selects the expert; B columns gather src1 rows via the id map from
+// kernel_mul_mm_id_map0 and scatter the result back through it.
+template <typename LoadA>
+kernel void kernel_mul_mat_id_tiled_impl(
+    constant ggml_metal_kargs_mul_mm_id & args [[buffer(0)]],
+    device const char * src0 [[buffer(1)]],
+    device const char * src1 [[buffer(2)]],
+    device const char * htpe [[buffer(3)]],
+    device const char * hids [[buffer(4)]],
+    device       char * dst  [[buffer(5)]],
+    threadgroup  char * shmem [[threadgroup(0)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tid   [[thread_index_in_threadgroup]]
+) {
+    threadgroup TiledSharedMemory * shared = (threadgroup TiledSharedMemory *)shmem;
+    threadgroup float2 * buf_a = shared->buf_a;
+    threadgroup float2 * buf_b = shared->buf_b;
+
+    const uint ir = tgpig.x;  // M dimension threadgroup index (output features)
+    const uint ic = tgpig.y;  // N dimension threadgroup index (token slot)
+    const uint im = tgpig.z;  // expert index
+
+    device const uint32_t * tpe_u32 = (device const uint32_t *) htpe;
+    device const int32_t  * ids_i32 = (device const int32_t  *) hids;
+
+    // number of token-slots routed to this expert
+    const uint neh1 = tpe_u32[im];
+    if (ic * BN >= neh1) {
+        return;
+    }
+
+    const uint warp_i = tid / WARP;
+    const uint tiw = tid % WARP;
+
+    const uint warp_r = warp_i % (BM / WM);
+    const uint warp_c = warp_i / (BM / WM);
+
+    const uint tiwr = tiw % (WSUBM / TM);
+    const uint tiwc = tiw / (WSUBM / TM);
+
+    const uint loadr_a = tid % (BK / LOAD_VEC_A);
+    const uint loadc_a = tid / (BK / LOAD_VEC_A);
+    const uint loadr_b = tid % (BK / LOAD_VEC_B);
+    const uint loadc_b = tid / (BK / LOAD_VEC_B);
+
+    const uint loadstride_a = BLOCK_SIZE * LOAD_VEC_A / BK;
+    const uint loadstride_b = BLOCK_SIZE * LOAD_VEC_B / BK;
+
+    // A tile: this expert's weight matrix (src0 + im*nb02), rows = ne0 features.
+    const uint64_t offset0 = (uint64_t) im * args.nb02;
+    LoadA loader;
+    loader.init(src0, offset0, ir, args);
+
+    const uint end_k = args.ne00;
+    const uint ne01  = args.ne0;        // output features (A rows)
+    const uint ks10  = args.nb10 / sizeof(float); // src1 K-stride in floats
+
+    float2 sums[WMITER * TM * WNITER * TN / 2];
+    for (uint i = 0; i < WMITER * TM * WNITER * TN / 2; i++) {
+        sums[i] = float2(0.0f);
+    }
+
+    for (uint block = 0; block < end_k; block += BK) {
+        for (uint l = 0; l < BM; l += loadstride_a) {
+            loader.load(buf_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, ne01, block, end_k);
+        }
+
+        // B tile: gather each column's src1 row through the expert id map.
+        for (uint l = 0; l < BN; l += loadstride_b) {
+            const uint col_local = loadc_b + l;            // 0 .. BN-1
+            const uint j         = ic * BN + col_local;    // global token-slot
+            const uint buf_idx   = col_local * SHMEM_STRIDE + loadr_b;
+            const uint k         = block + loadr_b * LOAD_VEC_B;
+
+            float2 vals = float2(0.0f);
+            if (j < neh1) {
+                const int id  = ids_i32[im * args.ne21 + j];
+                const int i11 = (id % args.ne20) % args.ne11;
+                const int i12 = id / args.ne20;
+                device const float * brow = (device const float *)(src1 + args.nb12 * i12 + args.nb11 * i11);
+                if (k + 1 < end_k) {
+                    vals = float2(brow[k * ks10], brow[(k + 1) * ks10]);
+                } else if (k < end_k) {
+                    vals = float2(brow[k * ks10], 0.0f);
+                }
+            }
+            buf_b[buf_idx] = vals;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        loader.advance();
+
+        float4 cache_a[WMITER * TM];
+        float4 cache_b;
+
+        for (uint i = 0; i < BK / 4; i++) {
+            for (uint wsir = 0; wsir < WMITER; wsir++) {
+                for (uint jj = 0; jj < TM; jj++) {
+                    const uint row = warp_r * WM + wsir * WSUBM + tiwr * TM + jj;
+                    cache_a[wsir * TM + jj].xy = buf_a[row * SHMEM_STRIDE + 2*i    ];
+                    cache_a[wsir * TM + jj].zw = buf_a[row * SHMEM_STRIDE + 2*i + 1];
+                }
+            }
+
+            for (uint wsic = 0; wsic < WNITER; wsic++) {
+                for (uint cc = 0; cc < TN; cc++) {
+                    const uint col = warp_c * WN + wsic * WSUBN + tiwc * TN + cc;
+                    cache_b.xy = buf_b[col * SHMEM_STRIDE + 2*i    ];
+                    cache_b.zw = buf_b[col * SHMEM_STRIDE + 2*i + 1];
+
+                    for (uint wsir = 0; wsir < WMITER; wsir++) {
+                        for (uint cr = 0; cr < TM / 2; cr++) {
+                            const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
+
+                            sums[sums_idx].x = fma(cache_a[wsir * TM + 2*cr    ].x, cache_b.x,
+                                               fma(cache_a[wsir * TM + 2*cr    ].y, cache_b.y,
+                                               fma(cache_a[wsir * TM + 2*cr    ].z, cache_b.z,
+                                               fma(cache_a[wsir * TM + 2*cr    ].w, cache_b.w, sums[sums_idx].x))));
+
+                            sums[sums_idx].y = fma(cache_a[wsir * TM + 2*cr + 1].x, cache_b.x,
+                                               fma(cache_a[wsir * TM + 2*cr + 1].y, cache_b.y,
+                                               fma(cache_a[wsir * TM + 2*cr + 1].z, cache_b.z,
+                                               fma(cache_a[wsir * TM + 2*cr + 1].w, cache_b.w, sums[sums_idx].y))));
+                        }
+                    }
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Scatter the output tile back to dst through the expert id map.
+    for (uint wsic = 0; wsic < WNITER; wsic++) {
+        for (uint wsir = 0; wsir < WMITER; wsir++) {
+            for (uint cc = 0; cc < TN; cc++) {
+                for (uint cr = 0; cr < TM / 2; cr++) {
+                    const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
+
+                    const uint dst_row0 = ir * BM + warp_r * WM + wsir * WSUBM + tiwr * TM + 2*cr;
+                    const uint dst_row1 = dst_row0 + 1;
+                    const uint dst_col  = ic * BN + warp_c * WN + wsic * WSUBN + tiwc * TN + cc;
+
+                    if (dst_col >= neh1) {
+                        continue;
+                    }
+
+                    const int id  = ids_i32[im * args.ne21 + dst_col];
+                    const int ide = id % args.ne20;
+                    const int idt = id / args.ne20;
+
+                    device float * D = (device float *) dst + (uint64_t) ide * args.ne0
+                                                            + (uint64_t) idt * args.ne1 * args.ne0;
+
+                    if (dst_row0 < args.ne0) {
+                        D[dst_row0] = sums[sums_idx].x;
+                    }
+                    if (dst_row1 < args.ne0) {
+                        D[dst_row1] = sums[sums_idx].y;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#define GGML_MM_ID_TILED_INST(suffix, loader)                                  \
+template [[host_name("kernel_mul_mat_id_tiled_" #suffix)]]                      \
+kernel void kernel_mul_mat_id_tiled_impl<loader>(                              \
+    constant ggml_metal_kargs_mul_mm_id &, device const char *,                \
+    device const char *, device const char *, device const char *,             \
+    device char *, threadgroup char *, uint3, ushort);
+
+GGML_MM_ID_TILED_INST(f16,     tiled_loader_f16)
+GGML_MM_ID_TILED_INST(f32,     tiled_loader_f32)
+#if defined(GGML_METAL_HAS_BF16)
+GGML_MM_ID_TILED_INST(bf16,    tiled_loader_bf16)
+#endif
+GGML_MM_ID_TILED_INST(mxfp4,   tiled_loader_mxfp4)
+GGML_MM_ID_TILED_INST(q8_0,    tiled_loader_q8_0)
+GGML_MM_ID_TILED_INST(q4_0,    tiled_loader_q4_0)
+GGML_MM_ID_TILED_INST(q4_1,    tiled_loader_q4_1)
+GGML_MM_ID_TILED_INST(q5_0,    tiled_loader_q5_0)
+GGML_MM_ID_TILED_INST(q5_1,    tiled_loader_q5_1)
+GGML_MM_ID_TILED_INST(iq4_nl,  tiled_loader_iq4_nl)
+GGML_MM_ID_TILED_INST(q4_K,    tiled_loader_q4_K)
+GGML_MM_ID_TILED_INST(q5_K,    tiled_loader_q5_K)
+GGML_MM_ID_TILED_INST(q6_K,    tiled_loader_q6_K)
+GGML_MM_ID_TILED_INST(q2_K,    tiled_loader_q2_K)
+GGML_MM_ID_TILED_INST(q3_K,    tiled_loader_q3_K)
+GGML_MM_ID_TILED_INST(iq4_xs,  tiled_loader_iq4_xs)
+GGML_MM_ID_TILED_INST(iq2_xxs, tiled_loader_iq2_xxs)
+GGML_MM_ID_TILED_INST(iq2_xs,  tiled_loader_iq2_xs)
+GGML_MM_ID_TILED_INST(iq2_s,   tiled_loader_iq2_s)
+GGML_MM_ID_TILED_INST(iq3_xxs, tiled_loader_iq3_xxs)
+GGML_MM_ID_TILED_INST(iq3_s,   tiled_loader_iq3_s)
+GGML_MM_ID_TILED_INST(iq1_s,   tiled_loader_iq1_s)
+GGML_MM_ID_TILED_INST(iq1_m,   tiled_loader_iq1_m)
