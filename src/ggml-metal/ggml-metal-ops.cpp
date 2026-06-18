@@ -430,6 +430,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_conv_transpose_1d(ctx, idx);
             } break;
+
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
                 n_fuse = ggml_metal_op_conv_transpose_2d(ctx, idx);
@@ -4755,9 +4756,9 @@ int ggml_metal_op_col2im_1d(ggml_metal_op_t ctx, int idx) {
     const int32_t OC = ((const int32_t *)(op->op_params))[1];
     const int32_t p0 = ((const int32_t *)(op->op_params))[2];
 
-    const int32_t K_OC  = (int32_t) op->src[0]->ne[0];
-    const int32_t T_in  = (int32_t) op->src[0]->ne[1];
-    const int32_t K     = K_OC / OC;
+    const int32_t K_OC = (int32_t) op->src[0]->ne[0];
+    const int32_t T_in = (int32_t) op->src[0]->ne[1];
+    const int32_t K    = K_OC / OC;
     const int32_t T_out = (int32_t) op->ne[0];
 
     ggml_metal_kargs_col2im_1d args = {
@@ -4773,19 +4774,21 @@ int ggml_metal_op_col2im_1d(ggml_metal_op_t ctx, int idx) {
     auto pipeline = ggml_metal_library_get_pipeline_col2im_1d(lib, op);
 
     const int total = T_out * OC;
-    const int nth   = 256;
-    const int ntg   = (total + nth - 1) / nth;
+    const int nth = 256;
+    const int ntg = (total + nth - 1) / nth;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
-    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+    ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),         2);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ntg, 1, 1, nth, 1, 1);
 
     return 1;
 }
 
+// Dispatch the fused snake kernel from the matched mul -> sin -> sqr -> mul -> add chain.
+// idx points at the leading mul. The autofuse caller has validated the chain.
 int ggml_metal_op_conv_transpose_2d(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 

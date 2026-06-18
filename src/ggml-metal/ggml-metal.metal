@@ -5474,6 +5474,7 @@ kernel void kernel_conv_transpose_1d<half>(
     uint3    tgpg[[threadgroups_per_grid]]);
 
 
+
 template <typename T>
 kernel void kernel_col2im_1d(
         constant ggml_metal_kargs_col2im_1d & args,
