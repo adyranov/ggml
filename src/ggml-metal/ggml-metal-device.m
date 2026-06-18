@@ -1,7 +1,10 @@
 #import "ggml-metal-device.h"
+#import "ggml-metal-ops.h" // ggml_metal_op_flash_attn_ext_use_vec (FA support gate)
 
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
+
+#include "ggml-metal-impl.h"
 
 #include <Foundation/Foundation.h>
 
@@ -92,6 +95,10 @@ void ggml_metal_pipeline_free(ggml_metal_pipeline_t pipeline) {
 
 int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_with_params pipeline) {
     return pipeline.pipeline->obj.maxTotalThreadsPerThreadgroup;
+}
+
+int ggml_metal_pipeline_simd_width(struct ggml_metal_pipeline_with_params pipeline) {
+    return pipeline.pipeline ? (int) pipeline.pipeline->obj.threadExecutionWidth : 0;
 }
 
 struct ggml_metal_library {
@@ -393,11 +400,25 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
         GGML_LOG_DEBUG("%s: compiling pipeline: base = '%s', name = '%s'\n", __func__, base, name);
 
-        id<MTLFunction> mtl_function;
-        if (!cv) {
-            mtl_function = [lib->obj newFunctionWithName:base_func];
-        } else {
-            mtl_function = [lib->obj newFunctionWithName:base_func constantValues:cv->obj error:&error];
+        // Always expose the real device SIMD width as a function constant so
+        // width-dependent kernels specialize for the hardware width (default 32
+        // until the probe completes). Augments the caller's constants if any.
+        ggml_metal_cv_t cv_eff   = cv;
+        bool            cv_owned = false;
+        if (!cv_eff) {
+            cv_eff   = ggml_metal_cv_init();
+            cv_owned = true;
+        }
+        {
+            const struct ggml_metal_device_props * p = ggml_metal_device_get_props(lib->dev);
+            ggml_metal_cv_set_int16(cv_eff, (int16_t) (p->simd_width > 0 ? p->simd_width : 32), FC_SIMD_WIDTH);
+            ggml_metal_cv_set_bool (cv_eff, p->reduce_via_shmem, FC_REDUCE_SHMEM);
+        }
+
+        id<MTLFunction> mtl_function = [lib->obj newFunctionWithName:base_func constantValues:cv_eff->obj error:&error];
+
+        if (cv_owned) {
+            ggml_metal_cv_free(cv_eff);
         }
         if (!mtl_function) {
             [lib->lock unlock];
@@ -676,6 +697,18 @@ static enum ggml_metal_device_id ggml_metal_device_id_parse(const char * name) {
     return GGML_METAL_DEVICE_GENERIC;
 }
 
+// Reduction-dependent kernels are validated at SIMD width 32. A vendor can be
+// opted in to run them at other widths (for on-hardware validation) via
+// GGML_METAL_VERIFIED_{APPLE,AMD,INTEL}.
+static bool ggml_metal_vendor_reduction_verified(enum ggml_gpu_vendor vendor) {
+    switch (vendor) {
+        case GGML_GPU_VENDOR_APPLE: return getenv("GGML_METAL_VERIFIED_APPLE") != NULL;
+        case GGML_GPU_VENDOR_AMD:   return getenv("GGML_METAL_VERIFIED_AMD")   != NULL;
+        case GGML_GPU_VENDOR_INTEL: return getenv("GGML_METAL_VERIFIED_INTEL") != NULL;
+        default:                    return false;
+    }
+}
+
 ggml_metal_device_t ggml_metal_device_init(int device) {
     ggml_metal_device_t dev = calloc(1, sizeof(struct ggml_metal_device));
 
@@ -696,6 +729,14 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             dev->props.has_simdgroup_reduction  = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
             dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
 
+            // GPUs missing the Apple7/Metal3 checks above can still do SIMD-group
+            // reduction via the Common2 family: AMD/Intel, and Apple Paravirtual CI
+            // VMs (Apple-branded but only Apple5/Common2/3). Otherwise reduction ops
+            // (mul_mv, soft_max, norm, ...) are disabled there.
+            dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyCommon2];
+
+            // simdgroup matrix-multiply hardware is Apple-Silicon only; AMD/Intel fall
+            // back to the scalar flash-attn kernel and the simd-reduction matmul path.
             dev->props.has_simdgroup_mm = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
             dev->props.has_unified_memory = dev->mtl_device.hasUnifiedMemory;
 
@@ -845,6 +886,24 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
 
             dev->props.device_id = ggml_metal_device_id_parse([[dev->mtl_device name] UTF8String]);
 
+            // vendor classification for non-Apple-Silicon Metal GPUs (AMD Radeon, Intel)
+            dev->props.vendor = GGML_GPU_VENDOR_UNKNOWN;
+            {
+                NSString * dev_name = [dev->mtl_device name];
+                if      ([dev_name containsString:@"Apple"]) dev->props.vendor = GGML_GPU_VENDOR_APPLE;
+                else if ([dev_name containsString:@"AMD"]   ||
+                         [dev_name containsString:@"Radeon"]) dev->props.vendor = GGML_GPU_VENDOR_AMD;
+                else if ([dev_name containsString:@"Intel"]) dev->props.vendor = GGML_GPU_VENDOR_INTEL;
+            }
+
+            // SIMD/threadExecutionWidth: safe default of 32; probed precisely from a
+            // real pipeline in a later stage (observed values range 16/32/64).
+            dev->props.simd_width = 32;
+
+            // Some iGPUs abort long command buffers; cap threadgroups per dispatch so
+            // the scalar flash-attn path can chunk. Others dispatch in one shot.
+            dev->props.max_threadgroups_per_dispatch = (dev->props.vendor == GGML_GPU_VENDOR_INTEL) ? 512 : 0;
+
             dev->props.op_offload_min_batch_size  = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
 
             dev->props.max_buffer_size            = dev->mtl_device.maxBufferLength;
@@ -863,6 +922,44 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 GGML_LOG_ERROR("%s: error: failed to create library\n", __func__);
             }
 
+            // Probe the real SIMD width from a representative reduction pipeline:
+            // a trivial kernel reports the advertised width (32 on the x86 VM), but
+            // real mat-vec kernels there run at 16. Defaults to 32 if the probe fails.
+            if (getenv("GGML_METAL_SIMD_WIDTH")) {
+                dev->props.simd_width = atoi(getenv("GGML_METAL_SIMD_WIDTH"));
+                GGML_LOG_INFO("%s: simd_width overridden via env = %d\n", __func__, dev->props.simd_width);
+            } else if (dev->library) {
+                ggml_metal_cv_t cv = ggml_metal_cv_init();
+                ggml_metal_cv_set_int16(cv, 4, FC_MUL_MV + 0); // nsg
+                ggml_metal_cv_set_int16(cv, 1, FC_MUL_MV + 2); // ne12
+                ggml_metal_cv_set_int16(cv, 1, FC_MUL_MV + 3); // r2
+                ggml_metal_cv_set_int16(cv, 1, FC_MUL_MV + 4); // r3
+                struct ggml_metal_pipeline_with_params ppl = ggml_metal_library_compile_pipeline(
+                    dev->library, "kernel_mul_mv_f32_f32", "ggml_probe_mul_mv_f32_f32", cv);
+                ggml_metal_cv_free(cv);
+                const int sw = ggml_metal_pipeline_simd_width(ppl);
+                if (sw > 0) {
+                    dev->props.simd_width = sw;
+                }
+            }
+
+            // Trust reduction kernels only on validated configs: Apple (any width)
+            // and AMD at width 32. Other widths/vendors fall back to CPU unless
+            // opted in via GGML_METAL_VERIFIED_*. (Probe defaults to 32 on failure,
+            // so requiring a known vendor also guards that case.)
+            const bool vendor_validated_at_32 =
+                dev->props.vendor == GGML_GPU_VENDOR_APPLE ||
+                dev->props.vendor == GGML_GPU_VENDOR_AMD;
+            dev->props.simd_reduction_trusted = dev->props.has_simdgroup_reduction &&
+                ((dev->props.simd_width == 32 && vendor_validated_at_32) ||
+                 ggml_metal_vendor_reduction_verified(dev->props.vendor));
+
+            // Intel's simd reduction intrinsics are unreliable; route it through the
+            // barrier-based shared-memory path. Forceable via GGML_METAL_REDUCE_SHMEM.
+            dev->props.reduce_via_shmem =
+                dev->props.vendor == GGML_GPU_VENDOR_INTEL ||
+                (getenv("GGML_METAL_REDUCE_SHMEM") && atoi(getenv("GGML_METAL_REDUCE_SHMEM")) != 0);
+
             if (dev->props.use_residency_sets) {
                 dev->rsets = ggml_metal_rsets_init();
             } else {
@@ -871,6 +968,14 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
 
             // print MTL GPU family:
             GGML_LOG_INFO("%s: GPU name:   %s (%s)\n", __func__, dev->props.name, dev->props.desc);
+
+            {
+                static const char * vendor_str[] = { "unknown", "Apple", "AMD", "Intel", "NVIDIA" };
+                GGML_LOG_INFO("%s: GPU vendor: %s (simd_width=%d, unified_memory=%s)\n", __func__,
+                    vendor_str[dev->props.vendor <= GGML_GPU_VENDOR_NVIDIA ? dev->props.vendor : 0],
+                    dev->props.simd_width,
+                    dev->props.has_unified_memory ? "true" : "false");
+            }
 
             // determine max supported GPU family
             // https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
@@ -899,6 +1004,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             }
 
             GGML_LOG_INFO("%s: simdgroup reduction   = %s\n", __func__, dev->props.has_simdgroup_reduction ? "true" : "false");
+            GGML_LOG_INFO("%s: reduction trusted     = %s\n", __func__, dev->props.simd_reduction_trusted ? "true" : "false");
             GGML_LOG_INFO("%s: simdgroup matrix mul. = %s\n", __func__, dev->props.has_simdgroup_mm        ? "true" : "false");
             GGML_LOG_INFO("%s: has unified memory    = %s\n", __func__, dev->props.has_unified_memory      ? "true" : "false");
             GGML_LOG_INFO("%s: has bfloat            = %s\n", __func__, dev->props.has_bfloat              ? "true" : "false");
@@ -1050,7 +1156,9 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
-    const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
+    // Gate reduction-dependent ops on the *trusted* capability (see init): untrusted
+    // widths/vendors report unsupported and fall back to CPU.
+    const bool has_simdgroup_reduction = dev->props.simd_reduction_trusted;
     const bool has_bfloat              = dev->props.has_bfloat;
 
     if (!has_bfloat) {

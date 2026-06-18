@@ -670,16 +670,25 @@ static enum ggml_backend_dev_type ggml_backend_metal_device_get_type(ggml_backen
 }
 
 static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
+
     props->name        = ggml_backend_metal_device_get_name(dev);
     props->description = ggml_backend_metal_device_get_description(dev);
     props->type        = ggml_backend_metal_device_get_type(dev);
 
     ggml_backend_metal_device_get_memory(dev, &props->memory_free, &props->memory_total);
 
+    // on non-UMA devices (discrete GPUs), disable buffer_from_host_ptr to force model weights
+    // into MTLResourceStorageModePrivate (VRAM) instead of MTLResourceStorageModeShared (system RAM).
+    // a host-pointer (no-copy, Shared) buffer on a discrete GPU is read over PCIe and can be
+    // rejected by the command buffer (MTLCommandBufferError "not permitted").
+    const bool allow_host_ptr = props_dev->use_shared_buffers;
+
     props->caps = {
         /* .async                = */ true,
         /* .host_buffer          = */ false,
-        /* .buffer_from_host_ptr = */ true,
+        /* .buffer_from_host_ptr = */ allow_host_ptr,
         /* .events               = */ true,
     };
 }
