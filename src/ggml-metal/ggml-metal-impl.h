@@ -102,6 +102,15 @@
 #define FC_UPSCALE                     1500
 #define FC_GATED_DELTA_NET             1600
 
+// Real device SIMD width (threadExecutionWidth), injected into every pipeline
+// at compile time. Width-dependent kernels read it instead of assuming 32.
+#define FC_SIMD_WIDTH                  1700
+
+// Whether reduction kernels use the barrier-based shared-memory reduction
+// instead of simdgroup reduction intrinsics (set for Intel). Injected into
+// every pipeline alongside FC_SIMD_WIDTH.
+#define FC_REDUCE_SHMEM                1701
+
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
 #define OP_FLASH_ATTN_EXT_NCPSG 64

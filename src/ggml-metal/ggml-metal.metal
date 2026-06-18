@@ -27,6 +27,183 @@ using namespace metal;
 
 #define N_SIMDWIDTH 32 // assuming SIMD group size is 32
 
+// Real device SIMD width, injected by the host at pipeline-compile time
+// (FC_SIMD_WIDTH). Width-dependent kernels use FC_nw instead of the literal 32;
+// helper/probe pipelines that do not set the constant fall back to N_SIMDWIDTH.
+constant short FC_simd_width [[function_constant(FC_SIMD_WIDTH)]];
+constant bool  FC_simd_width_def = is_function_constant_defined(FC_simd_width);
+constant short FC_nw = FC_simd_width_def ? FC_simd_width : N_SIMDWIDTH;
+
+// When set (Intel, or forced for validation), reduction kernels use a
+// barrier-based shared-memory reduction instead of simdgroup intrinsics
+// (simd_sum / simd_max / simd_shuffle), which are unreliable on Intel and
+// width-dependent elsewhere. Defaults to false for helper/probe pipelines.
+constant bool FC_reduce_shmem_def [[function_constant(FC_REDUCE_SHMEM)]];
+constant bool FC_reduce_via_shmem = is_function_constant_defined(FC_reduce_shmem_def) ? FC_reduce_shmem_def : false;
+
+// Barrier-only threadgroup reductions over the first `n` threads. Each thread
+// contributes `v` (written to buf[tid]); after the call every thread sees the
+// reduced value in buf[0]. Intrinsic-free and width-agnostic. `buf` must hold
+// at least `n` elements. These are only instantiated on the shmem path.
+inline float helper_tg_reduce_sum(float v, threadgroup float * buf, ushort tid, ushort n) {
+    buf[tid] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (ushort s = n; s > 1; ) {
+        const ushort h = (s + 1) >> 1;
+        if (tid + h < s) {
+            buf[tid] += buf[tid + h];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        s = h;
+    }
+    const float r = buf[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup); // let every thread read buf[0] before buf is reused
+    return r;
+}
+
+inline float helper_tg_reduce_max(float v, threadgroup float * buf, ushort tid, ushort n) {
+    buf[tid] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (ushort s = n; s > 1; ) {
+        const ushort h = (s + 1) >> 1;
+        if (tid + h < s) {
+            buf[tid] = max(buf[tid], buf[tid + h]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        s = h;
+    }
+    const float r = buf[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup); // let every thread read buf[0] before buf is reused
+    return r;
+}
+
+// Simdgroup-scoped barrier reduction, the intrinsic-free replacement for
+// simd_sum() inside mat-vec kernels. Each simdgroup reduces its own `nw` lanes
+// using a private `nw`-element segment of `buf` (buf must hold nsg*nw floats);
+// `sgitg` selects the segment, `tiisg` the lane. Uses simdgroup_barrier rather
+// than a threadgroup barrier because callers reduce inside loops whose trip
+// count varies per simdgroup (e.g. r0 + row < ne01), which would deadlock a
+// threadgroup-wide barrier. Only instantiated on the shmem path.
+inline float helper_sg_reduce_sum(float v, threadgroup float * buf, ushort sgitg, ushort tiisg, ushort nw) {
+    threadgroup float * seg = buf + (uint) sgitg * nw;
+    seg[tiisg] = v;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (ushort s = nw; s > 1; ) {
+        const ushort h = (s + 1) >> 1;
+        if (tiisg + h < s) {
+            seg[tiisg] += seg[tiisg + h];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        s = h;
+    }
+    const float r = seg[0];
+    simdgroup_barrier(mem_flags::mem_threadgroup); // let every lane read seg[0] before seg is reused
+    return r;
+}
+
+// Barrier-only threadgroup argmax over the first `n` threads. Each thread
+// contributes a candidate (value `v`, index `i`); after the call every thread
+// sees the index of the maximum value. Ties resolve to the smaller index to
+// match the reference top-k ordering. `sv`/`si` are scratch holding >= n
+// elements each. Intrinsic-free and width-agnostic.
+inline int helper_tg_argmax(float v, int i, threadgroup float * sv, threadgroup int * si, ushort tid, ushort n) {
+    sv[tid] = v;
+    si[tid] = i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (ushort s = n; s > 1; ) {
+        const ushort h = (s + 1) >> 1;
+        if (tid + h < s) {
+            const float ov = sv[tid + h];
+            const int   oi = si[tid + h];
+            if (ov > sv[tid] || (ov == sv[tid] && oi < si[tid])) {
+                sv[tid] = ov;
+                si[tid] = oi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        s = h;
+    }
+    const int r = si[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup); // let every thread read si[0] before scratch is reused
+    return r;
+}
+
+// Cross-simdgroup combine for the norm family (kernel_norm / kernel_rms_norm /
+// kernel_l2_norm): the caller pre-zeroes the staging buffer and every thread
+// combines unconditionally. The simd path is byte-identical to the upstream
+// sequence (simd_sum -> stage per-simdgroup partials -> simd_sum); the shmem
+// path is the width-agnostic barrier reduction.
+inline float helper_reduce_sum_norm(float v, threadgroup float * shmem, ushort tpitg, ushort ntg, ushort tiisg, ushort sgitg) {
+    if (FC_reduce_via_shmem) {
+        return helper_tg_reduce_sum(v, shmem, tpitg, ntg);
+    }
+    v = simd_sum(v);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem[sgitg] = v;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    v = shmem[tiisg];
+    v = simd_sum(v);
+    return v;
+}
+
+// Cross-simdgroup combine for the soft_max / group_norm idiom: the
+// multi-simdgroup combine is guarded by ntg > FC_nw and the staging buffer is
+// initialised here. The simd path is byte-identical to upstream; the shmem path
+// is the width-agnostic barrier reduction.
+inline float helper_reduce_sum(float v, threadgroup float * shmem, ushort tpitg, ushort ntg, ushort tiisg, ushort sgitg) {
+    if (FC_reduce_via_shmem) {
+        return helper_tg_reduce_sum(v, shmem, tpitg, ntg);
+    }
+    v = simd_sum(v);
+    if (ntg > FC_nw) {
+        if (sgitg == 0) {
+            shmem[tiisg] = 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tiisg == 0) {
+            shmem[sgitg] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        v = shmem[tiisg];
+        v = simd_sum(v);
+    }
+    return v;
+}
+
+inline float helper_reduce_max(float v, threadgroup float * shmem, ushort tpitg, ushort ntg, ushort tiisg, ushort sgitg) {
+    if (FC_reduce_via_shmem) {
+        return helper_tg_reduce_max(v, shmem, tpitg, ntg);
+    }
+    v = simd_max(v);
+    if (ntg > FC_nw) {
+        if (sgitg == 0) {
+            shmem[tiisg] = -INFINITY;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tiisg == 0) {
+            shmem[sgitg] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        v = shmem[tiisg];
+        v = simd_max(v);
+    }
+    return v;
+}
+
 // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
 //
 // cmd:

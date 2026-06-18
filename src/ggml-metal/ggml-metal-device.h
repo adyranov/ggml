@@ -6,6 +6,17 @@
 extern "C" {
 #endif
 
+// GPU vendor classification used to gate non-Apple-Silicon Metal behavior
+// (AMD Radeon discrete, Intel UHD/Arc) without assuming Apple Silicon traits
+// (unified memory, simd_shuffle/quad_group intrinsics, SIMD width 32).
+enum ggml_gpu_vendor {
+    GGML_GPU_VENDOR_UNKNOWN = 0,
+    GGML_GPU_VENDOR_APPLE   = 1,
+    GGML_GPU_VENDOR_AMD     = 2,
+    GGML_GPU_VENDOR_INTEL   = 3,
+    GGML_GPU_VENDOR_NVIDIA  = 4,
+};
+
 struct ggml_metal_buffer_id {
     void * metal; // id<MTLBuffer>
     size_t offs;
@@ -59,6 +70,10 @@ struct ggml_metal_pipeline_with_params {
 };
 
 int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_with_params pipeline);
+
+// threadExecutionWidth (SIMD/warp/wavefront width) of a compiled pipeline.
+// Used to probe the real device SIMD width for non-Apple-Silicon GPUs.
+int ggml_metal_pipeline_simd_width(struct ggml_metal_pipeline_with_params pipeline);
 
 //
 // MTLCommandBuffer wrapper
@@ -260,6 +275,30 @@ struct ggml_metal_device_props {
     bool supports_gpu_family_apple7;
 
     enum ggml_metal_device_id device_id;
+
+    // Non-Apple-Silicon support: vendor classification and probed SIMD width,
+    // used to specialise kernels and resource policy for AMD and Intel GPUs.
+    enum ggml_gpu_vendor vendor;
+    int                  simd_width; // threadExecutionWidth (Apple/AMD RDNA=32, AMD GCN=64, Intel=16)
+
+    // Max threadgroups per dispatch for timeout-prone ops (0 = unlimited). Used to
+    // chunk the scalar flash-attn dispatch on Intel iGPUs that abort long command
+    // buffers; AMD/Apple leave this at 0 and dispatch in one shot.
+    uint32_t max_threadgroups_per_dispatch;
+
+    // Whether reduction-dependent kernels (soft_max, norm, mul_mv, flash-attn, ...)
+    // can be trusted on this device. Those kernels use simdgroup reduction
+    // intrinsics that assume a SIMD width of 32; at other widths they are not yet
+    // validated and may be incorrect, so the corresponding ops are reported as
+    // unsupported (CPU fallback) unless the vendor is explicitly opted in.
+    bool simd_reduction_trusted;
+
+    // Whether reduction kernels must use the barrier-based shared-memory path
+    // instead of simdgroup reduction intrinsics. Set for Intel, whose
+    // simd_sum/simd_max/simd_shuffle are unreliable; the shmem path is
+    // width-agnostic and intrinsic-free. Forced on for any vendor via
+    // GGML_METAL_REDUCE_SHMEM for validation.
+    bool reduce_via_shmem;
 
     int op_offload_min_batch_size;
 };
