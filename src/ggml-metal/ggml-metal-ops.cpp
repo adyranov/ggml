@@ -2877,6 +2877,262 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_tmp = bid_blk;
     bid_tmp.offs += ggml_metal_op_flash_attn_ext_extra_blk(op);
 
+    // Tiled flash-attn (flat-indexed, width-agnostic), dk=dv=64 only. Opt-in via
+    // GGML_METAL_FA_INTEL; FA_SCALAR takes precedence. Other shapes fall through.
+    {
+        const bool fa_force_scalar = getenv("GGML_METAL_FA_SCALAR") != NULL;
+        const bool fa_force_intel  = getenv("GGML_METAL_FA_INTEL")  != NULL;
+        const bool use_intel_tiled = !fa_force_scalar && fa_force_intel && (ne00 % 16 == 0);
+
+        const int       dk      = ne00;
+        const int       dv      = op->src[2]->ne[0];
+        const ggml_type kv_type = op->src[1]->type;
+
+        const char * kernel_name = NULL;
+        if (use_intel_tiled && dk == 64 && dv == 64) {
+            switch (kv_type) {
+                case GGML_TYPE_Q8_0: kernel_name = "kernel_flash_attn_ext_tiled_q8_0_dk64_dv64"; break;
+                case GGML_TYPE_Q4_0: kernel_name = "kernel_flash_attn_ext_tiled_q4_0_dk64_dv64"; break;
+                case GGML_TYPE_F16:  kernel_name = "kernel_flash_attn_ext_tiled_dk64_dv64";      break;
+                default: break;
+            }
+        }
+
+        if (kernel_name != NULL) {
+            auto pipeline = ggml_metal_library_compile_pipeline(lib, kernel_name, kernel_name, NULL);
+            GGML_ASSERT(pipeline.pipeline && "failed to compile tiled FA pipeline");
+
+            constexpr int TG_SIZE = 128;
+            constexpr int Bc      = 32;
+
+            // Q(dk floats) + K tile(Bc*dk halfs) + V tile(Bc*dv halfs)
+            //   + scores(Bc floats) + reduce scratch(TG_SIZE floats)
+            const size_t smem = (size_t) dk * sizeof(float)
+                              + (size_t) Bc * dk * sizeof(uint16_t)
+                              + (size_t) Bc * dv * sizeof(uint16_t)
+                              + (size_t) Bc * sizeof(float)
+                              + (size_t) TG_SIZE * sizeof(float);
+
+            ggml_metal_kargs_flash_attn_ext args = {
+                /*.ne01          =*/ ne01,
+                /*.ne02          =*/ ne02,
+                /*.ne03          =*/ ne03,
+                /*.nb01          =*/ nb01,
+                /*.nb02          =*/ nb02,
+                /*.nb03          =*/ nb03,
+                /*.ne11          =*/ ne11,
+                /*.ne_12_2       =*/ ne12,
+                /*.ne_12_3       =*/ ne13,
+                /*.ns10          =*/ has_sinks ? 1 : 0, // repurposed: has_sinks flag
+                /*.nb11          =*/ nb11,
+                /*.nb12          =*/ nb12,
+                /*.nb13          =*/ nb13,
+                /*.ns20          =*/ 0,
+                /*.nb21          =*/ nb21,
+                /*.nb22          =*/ nb22,
+                /*.nb23          =*/ nb23,
+                /*.ne31          =*/ ne31,
+                /*.ne32          =*/ ne32,
+                /*.ne33          =*/ ne33,
+                /*.nb31          =*/ nb31,
+                /*.nb32          =*/ nb32,
+                /*.nb33          =*/ nb33,
+                /*.ne1           =*/ ne1,
+                /*.ne2           =*/ ne2,
+                /*.ne3           =*/ ne3,
+                /*.scale         =*/ scale,
+                /*.max_bias      =*/ max_bias,
+                /*.m0            =*/ m0,
+                /*.m1            =*/ m1,
+                /*.n_head_log2   =*/ n_head_log2,
+                /*.logit_softcap =*/ logit_softcap,
+            };
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+            ggml_metal_encoder_set_buffer  (enc, bid_src2, 3);
+            ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+            ggml_metal_encoder_set_buffer  (enc, bid_src4, 6);
+
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+
+            // Chunk along the query dimension on GPUs that cap threadgroups per
+            // dispatch (Intel) to avoid command-buffer timeouts; AMD/Apple single shot.
+            const int32_t total_tg = ne01 * ne02 * ne03;
+            const int32_t chunk    = (int32_t) props_dev->max_threadgroups_per_dispatch;
+
+            if (chunk > 0 && total_tg > chunk) {
+                const int32_t chunk_queries = chunk / (ne02 * ne03);
+                GGML_ASSERT(chunk_queries > 0 && "FA chunk size too small for head*batch count");
+
+                for (int32_t q_offset = 0; q_offset < ne01; q_offset += chunk_queries) {
+                    const int32_t q_count = ((q_offset + chunk_queries) < ne01) ? chunk_queries : (ne01 - q_offset);
+
+                    uint32_t q_offset_u32 = (uint32_t) q_offset;
+                    ggml_metal_encoder_set_bytes(enc, &q_offset_u32, sizeof(q_offset_u32), 7);
+                    ggml_metal_encoder_dispatch_threadgroups(enc, q_count, ne02, ne03, TG_SIZE, 1, 1);
+                }
+            } else {
+                uint32_t q_offset = 0;
+                ggml_metal_encoder_set_bytes(enc, &q_offset, sizeof(q_offset), 7);
+                ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, TG_SIZE, 1, 1);
+            }
+
+            return 1;
+        }
+    }
+
+    // Scalar flash-attn for GPUs that need it. The vec kernel assumes a 32-wide
+    // SIMD, so force scalar only when there is no simdgroup matrix HW AND one of:
+    //   - Intel iGPU      : vec compiles to width 16 but assumes 32
+    //   - simd_width != 32 : AMD GCN/Vega (width 64) would read uninitialized lanes
+    //   - shape unsupported by the vec kernel (large batch / odd head size)
+    // AMD RDNA (width 32) therefore keeps the fast vec kernel for small-batch decode
+    // while prefill still falls to scalar. FA_SCALAR forces scalar anywhere.
+    {
+        const bool fa_force_scalar = getenv("GGML_METAL_FA_SCALAR") != NULL;
+        const bool fa_use_scalar   = fa_force_scalar ||
+            (!props_dev->has_simdgroup_mm &&
+             (props_dev->vendor == GGML_GPU_VENDOR_INTEL ||
+              props_dev->simd_width != 32 ||
+              !ggml_metal_op_flash_attn_ext_use_vec(op)));
+
+        const int       dk      = ne00;          // K/query head size
+        const int       dv      = op->src[2]->ne[0]; // V head size
+        const ggml_type kv_type = op->src[1]->type;
+
+        const bool is_square = (dk == dv);
+
+        const char * kernel_name = NULL;
+        if (fa_use_scalar && !is_square) {
+            // Non-square heads (multi-head latent attention): only F16 (576, 512).
+            if (kv_type == GGML_TYPE_F16 && dk == 576 && dv == 512) {
+                kernel_name = "kernel_flash_attn_ext_scalar_dk576_dv512";
+            }
+        } else if (fa_use_scalar && is_square) {
+            if (kv_type == GGML_TYPE_Q8_0) {
+                switch (dk) {
+                    case 64:  kernel_name = "kernel_flash_attn_ext_scalar_q8_0_dk64_dv64";   break;
+                    case 128: kernel_name = "kernel_flash_attn_ext_scalar_q8_0_dk128_dv128"; break;
+                    case 256: kernel_name = "kernel_flash_attn_ext_scalar_q8_0_dk256_dv256"; break;
+                }
+            } else if (kv_type == GGML_TYPE_Q4_0) {
+                switch (dk) {
+                    case 64:  kernel_name = "kernel_flash_attn_ext_scalar_q4_0_dk64_dv64";   break;
+                    case 128: kernel_name = "kernel_flash_attn_ext_scalar_q4_0_dk128_dv128"; break;
+                    case 256: kernel_name = "kernel_flash_attn_ext_scalar_q4_0_dk256_dv256"; break;
+                }
+            } else if (kv_type == GGML_TYPE_F16) {
+                switch (dk) {
+                    case 32:  kernel_name = "kernel_flash_attn_ext_scalar_dk32_dv32";   break;
+                    case 40:  kernel_name = "kernel_flash_attn_ext_scalar_dk40_dv40";   break;
+                    case 48:  kernel_name = "kernel_flash_attn_ext_scalar_dk48_dv48";   break;
+                    case 64:  kernel_name = "kernel_flash_attn_ext_scalar_dk64_dv64";   break;
+                    case 72:  kernel_name = "kernel_flash_attn_ext_scalar_dk72_dv72";   break;
+                    case 80:  kernel_name = "kernel_flash_attn_ext_scalar_dk80_dv80";   break;
+                    case 96:  kernel_name = "kernel_flash_attn_ext_scalar_dk96_dv96";   break;
+                    case 112: kernel_name = "kernel_flash_attn_ext_scalar_dk112_dv112"; break;
+                    case 128: kernel_name = "kernel_flash_attn_ext_scalar_dk128_dv128"; break;
+                    case 192: kernel_name = "kernel_flash_attn_ext_scalar_dk192_dv192"; break;
+                    case 256: kernel_name = "kernel_flash_attn_ext_scalar_dk256_dv256"; break;
+                    case 576: kernel_name = "kernel_flash_attn_ext_scalar_dk576_dv576"; break;
+                }
+            }
+        }
+
+        // Only the genuine (non-forced) fallback should ever reach here, in which case
+        // ggml_metal_device_supports_op guarantees a supported shape. If forced on an
+        // unsupported shape, fall through to the regular paths below.
+        if (fa_use_scalar && kernel_name != NULL) {
+            auto pipeline = ggml_metal_library_compile_pipeline(lib, kernel_name, kernel_name, NULL);
+            GGML_ASSERT(pipeline.pipeline && "failed to compile scalar FA pipeline");
+
+            // BD = pipeline threadExecutionWidth; the kernel adapts to a smaller
+            // runtime SIMD width via [[threads_per_simdgroup]].
+            const int BD = ggml_metal_pipeline_simd_width(pipeline);
+
+            ggml_metal_kargs_flash_attn_ext args = {
+                /*.ne01          =*/ ne01,
+                /*.ne02          =*/ ne02,
+                /*.ne03          =*/ ne03,
+                /*.nb01          =*/ nb01,
+                /*.nb02          =*/ nb02,
+                /*.nb03          =*/ nb03,
+                /*.ne11          =*/ ne11,
+                /*.ne_12_2       =*/ ne12,
+                /*.ne_12_3       =*/ ne13,
+                /*.ns10          =*/ has_sinks ? 1 : 0, // repurposed: has_sinks flag for scalar kernel
+                /*.nb11          =*/ nb11,
+                /*.nb12          =*/ nb12,
+                /*.nb13          =*/ nb13,
+                /*.ns20          =*/ 0,
+                /*.nb21          =*/ nb21,
+                /*.nb22          =*/ nb22,
+                /*.nb23          =*/ nb23,
+                /*.ne31          =*/ ne31,
+                /*.ne32          =*/ ne32,
+                /*.ne33          =*/ ne33,
+                /*.nb31          =*/ nb31,
+                /*.nb32          =*/ nb32,
+                /*.nb33          =*/ nb33,
+                /*.ne1           =*/ ne1,
+                /*.ne2           =*/ ne2,
+                /*.ne3           =*/ ne3,
+                /*.scale         =*/ scale,
+                /*.max_bias      =*/ max_bias,
+                /*.m0            =*/ m0,
+                /*.m1            =*/ m1,
+                /*.n_head_log2   =*/ n_head_log2,
+                /*.logit_softcap =*/ logit_softcap,
+            };
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+            ggml_metal_encoder_set_buffer  (enc, bid_src2, 3);
+            ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+            ggml_metal_encoder_set_buffer  (enc, bid_src4, 6);
+
+            // 1 query per threadgroup, BN simdgroups x BD threads. Shared memory
+            // must cover the worst case of a small runtime SIMD width (BD=8).
+            const int    BN      = 4;
+            const int    tg_size = BN * BD;
+            const int    BN_max  = tg_size / 8;
+            const size_t smem    = (2 * BN_max + tg_size) * sizeof(float);
+
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+
+            // Chunk along the query dimension on GPUs that cap threadgroups per
+            // dispatch (Intel) to avoid command-buffer timeouts; AMD/Apple = single shot.
+            const int32_t  total_tg = ne01 * ne02 * ne03;
+            const int32_t  chunk    = (int32_t) props_dev->max_threadgroups_per_dispatch;
+
+            if (chunk > 0 && total_tg > chunk) {
+                const int32_t chunk_queries = chunk / (ne02 * ne03);
+                GGML_ASSERT(chunk_queries > 0 && "FA chunk size too small for head*batch count");
+
+                for (int32_t q_offset = 0; q_offset < ne01; q_offset += chunk_queries) {
+                    const int32_t q_count = ((q_offset + chunk_queries) < ne01) ? chunk_queries : (ne01 - q_offset);
+
+                    uint32_t q_offset_u32 = (uint32_t) q_offset;
+                    ggml_metal_encoder_set_bytes(enc, &q_offset_u32, sizeof(q_offset_u32), 7);
+                    ggml_metal_encoder_dispatch_threadgroups(enc, q_count, ne02, ne03, BN * BD, 1, 1);
+                }
+            } else {
+                uint32_t q_offset = 0;
+                ggml_metal_encoder_set_bytes(enc, &q_offset, sizeof(q_offset), 7);
+                ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, BN * BD, 1, 1);
+            }
+
+            return 1;
+        }
+    }
+
     if (!ggml_metal_op_flash_attn_ext_use_vec(op)) {
         // half8x8 kernel
         const int nqptg = OP_FLASH_ATTN_EXT_NQPSG; // queries per threadgroup

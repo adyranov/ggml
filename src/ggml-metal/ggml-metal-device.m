@@ -1366,7 +1366,43 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 default:
                     return false;
             }
-            return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+            // Apple Silicon (simdgroup matrix-multiply available): the upstream vec kernel
+            // (small batch) and simdgroup_mm kernel (large batch) are both valid. The vec
+            // kernel needs only simdgroup reduction, which Apple Silicon always has.
+            if (has_simdgroup_mm) {
+                return has_simdgroup_reduction;
+            }
+            // AMD/Intel (no simdgroup_mm): the simdgroup_mm kernel is unavailable, so
+            // shape support is gated by the scalar kernel's head sizes. AMD RDNA
+            // (simd_width 32) additionally uses the vec kernel for small-batch decode
+            // at dispatch time, but only for head sizes already in the scalar list
+            // (all vec-eligible decode sizes are a subset), so the gate below is a
+            // superset and needs no special case. Intel and AMD GCN/Vega stay scalar.
+            if (has_simdgroup_reduction) {
+                const enum ggml_type kv_type = op->src[1]->type;
+                const int dk = op->src[0]->ne[0]; // K/query head size
+                const int dv = op->src[2]->ne[0]; // V head size
+                if (dk != dv) {
+                    // Non-square heads (multi-head latent attention): only the F16
+                    // (dk=576, dv=512) kernel is compiled.
+                    return kv_type == GGML_TYPE_F16 && dk == 576 && dv == 512;
+                }
+                switch (kv_type) {
+                    case GGML_TYPE_F16:
+                        // scalar F16 kernels exist for these head sizes (not 320/512)
+                        return dk == 32  || dk == 40  || dk == 48  ||
+                               dk == 64  || dk == 72  || dk == 80  ||
+                               dk == 96  || dk == 112 || dk == 128 ||
+                               dk == 192 || dk == 256 || dk == 576;
+                    case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q4_0:
+                        // scalar quantized K/V kernels exist for dk={64,128,256}
+                        return dk == 64 || dk == 128 || dk == 256;
+                    default:
+                        return false;
+                }
+            }
+            return false;
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
