@@ -1847,13 +1847,25 @@ kernel void kernel_sum_rows_impl(
         shmem_t[tiisg] = 0.0f;
     }
 
-    device const T0 * src_row = (device const T0 *) (src0 + i1*args.nb01 + i2*args.nb02 + i3*args.nb03);
-    device       T  * dst_row = (device       T  *) (dst  + i1*args.nb1  + i2*args.nb2  + i3*args.nb3);
+    device const char * src_base = src0 + i1*args.nb01 + i2*args.nb02 + i3*args.nb03;
+    device       T    * dst_row  = (device T *) (dst + i1*args.nb1 + i2*args.nb2 + i3*args.nb3);
 
     T0 sumf = T0(0.0f);
 
-    for (int64_t i0 = tpitg.x; i0 < args.ne00; i0 += ntg.x) {
-        sumf += src_row[i0];
+    // The scalar (T0 == float) variant byte-strides by nb00 so a transposed
+    // (non-contiguous) src0 is summed directly — this lets sum_rows replace the
+    // ggml_cont(ggml_transpose(...)) "sum_cols" pattern. The float4 variant is
+    // host-gated to contiguous src0 only (it cannot vec4-load nb00-apart elements),
+    // so it keeps packed float4 indexing. Both branches resolve at compile time.
+    if (is_same<float4, T0>::value) {
+        device const T0 * src_row = (device const T0 *) src_base;
+        for (int64_t i0 = tpitg.x; i0 < args.ne00; i0 += ntg.x) {
+            sumf += src_row[i0];
+        }
+    } else {
+        for (int64_t i0 = tpitg.x; i0 < args.ne00; i0 += ntg.x) {
+            sumf += *((device const T0 *)(src_base + i0*args.nb00));
+        }
     }
 
     sumf = simd_sum(sumf);
@@ -2115,23 +2127,7 @@ kernel void kernel_soft_max(
     }
 
     // find the max value in the block
-    float max_val = simd_max(lmax);
-    if (tptg.x > N_SIMDWIDTH) {
-        if (sgitg == 0) {
-            buf[tiisg] = -INFINITY;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (tiisg == 0) {
-            buf[sgitg] = max_val;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        max_val = buf[tiisg];
-        max_val = simd_max(max_val);
-    }
+    float max_val = helper_reduce_max(lmax, buf, tpitg.x, tptg.x, tiisg, sgitg);
 
     // parallel sum
     float lsum = 0.0f;
@@ -2145,24 +2141,7 @@ kernel void kernel_soft_max(
     // ref: https://github.com/ggml-org/ggml/pull/621#discussion_r1425156335
     threadgroup_barrier(mem_flags::mem_none);
 
-    float sum = simd_sum(lsum);
-
-    if (tptg.x > N_SIMDWIDTH) {
-        if (sgitg == 0) {
-            buf[tiisg] = 0.0f;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (tiisg == 0) {
-            buf[sgitg] = sum;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        sum = buf[tiisg];
-        sum = simd_sum(sum);
-    }
+    float sum = helper_reduce_sum(lsum, buf, tpitg.x, tptg.x, tiisg, sgitg);
 
     if (psrc2) {
         sum += exp(psrc2[i02] - max_val);
@@ -2221,23 +2200,7 @@ kernel void kernel_soft_max_4(
 
     const float lmax = MAX(MAX(lmax4[0], lmax4[1]), MAX(lmax4[2], lmax4[3]));
 
-    float max_val = simd_max(lmax);
-    if (tptg.x > N_SIMDWIDTH) {
-        if (sgitg == 0) {
-            buf[tiisg] = -INFINITY;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (tiisg == 0) {
-            buf[sgitg] = max_val;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        max_val = buf[tiisg];
-        max_val = simd_max(max_val);
-    }
+    float max_val = helper_reduce_max(lmax, buf, tpitg.x, tptg.x, tiisg, sgitg);
 
     // parallel sum
     float4 lsum4 = 0.0f;
@@ -2253,24 +2216,7 @@ kernel void kernel_soft_max_4(
     // ref: https://github.com/ggml-org/ggml/pull/621#discussion_r1425156335
     threadgroup_barrier(mem_flags::mem_none);
 
-    float sum = simd_sum(lsum);
-
-    if (tptg.x > N_SIMDWIDTH) {
-        if (sgitg == 0) {
-            buf[tiisg] = 0.0f;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (tiisg == 0) {
-            buf[sgitg] = sum;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        sum = buf[tiisg];
-        sum = simd_sum(sum);
-    }
+    float sum = helper_reduce_sum(lsum, buf, tpitg.x, tptg.x, tiisg, sgitg);
 
     if (psrc2) {
         sum += exp(psrc2[i02] - max_val);
@@ -3035,7 +2981,7 @@ kernel void kernel_solve_tri_f32(
 
             for (short t = 0; t*NW < N; ++t) {
                 const short idx = t*NW + tiisg;
-                sh0_cur[idx] = src0_ptr[idx];
+                sh0_cur[idx] = idx < N ? src0_ptr[idx] : 0.0f;
             }
 
             src0_ptr += NSG*N;
@@ -3056,7 +3002,7 @@ kernel void kernel_solve_tri_f32(
 
             for (short t = 0; t*NW < r; ++t) {
                 const short idx = t*NW + tiisg;
-                sum += sh0_cur[idx] * dst_ptr[idx*K] * (idx < r);
+                sum += select(0.0f, sh0_cur[idx] * dst_ptr[idx*K], idx < r);
             }
 
             sum = simd_sum(sum);
@@ -3167,18 +3113,7 @@ kernel void kernel_norm_fuse_impl(
         sumft += x[i00];
     }
     sumf = dot(sumft, T(1.0f));
-    sumf = simd_sum(sumf);
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tiisg == 0) {
-        shmem_f32[sgitg] = sumf;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    sumf = shmem_f32[tiisg];
-    sumf = simd_sum(sumf);
+    sumf = helper_reduce_sum_norm(sumf, shmem_f32, tpitg.x, ntg.x, tiisg, sgitg);
 
     const float mean = sumf/args.ne00;
 
@@ -3189,18 +3124,7 @@ kernel void kernel_norm_fuse_impl(
         y[i00] = x[i00] - mean;
         sumf += dot(y[i00], y[i00]);
     }
-    sumf = simd_sum(sumf);
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tiisg == 0) {
-        shmem_f32[sgitg] = sumf;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    sumf = shmem_f32[tiisg];
-    sumf = simd_sum(sumf);
+    sumf = helper_reduce_sum_norm(sumf, shmem_f32, tpitg.x, ntg.x, tiisg, sgitg);
 
     const float variance = sumf/args.ne00;
 
@@ -3263,18 +3187,7 @@ kernel void kernel_rms_norm_fuse_impl(
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
         sumf += dot(x[i00], x[i00]);
     }
-    sumf = simd_sum(sumf);
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tiisg == 0) {
-        shmem_f32[sgitg] = sumf;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    sumf = shmem_f32[tiisg];
-    sumf = simd_sum(sumf);
+    sumf = helper_reduce_sum_norm(sumf, shmem_f32, tpitg.x, ntg.x, tiisg, sgitg);
 
     const float mean  = sumf/args.ne00;
     const float scale = 1.0f/sqrt(mean + args.eps);
@@ -3331,18 +3244,7 @@ kernel void kernel_l2_norm_impl(
     for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
         sumf += dot(x[i00], x[i00]);
     }
-    sumf = simd_sum(sumf);
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tiisg == 0) {
-        shmem_f32[sgitg] = sumf;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    sumf = shmem_f32[tiisg];
-    sumf = simd_sum(sumf);
+    sumf = helper_reduce_sum_norm(sumf, shmem_f32, tpitg.x, ntg.x, tiisg, sgitg);
 
     const float scale = 1.0f/max(sqrt(sumf), args.eps);
 
@@ -3385,23 +3287,7 @@ kernel void kernel_group_norm_f32(
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    tmp = simd_sum(tmp);
-    if (ntg > N_SIMDWIDTH) {
-        if (sgitg == 0) {
-            buf[tiisg] = 0.0f;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (tiisg == 0) {
-            buf[sgitg] = tmp;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        tmp = buf[tiisg];
-        tmp = simd_sum(tmp);
-    }
+    tmp = helper_reduce_sum(tmp, buf, tpitg, ntg, tiisg, sgitg);
 
     const float mean = tmp / gs;
     tmp = 0.0f;
@@ -3412,23 +3298,7 @@ kernel void kernel_group_norm_f32(
         tmp += xi * xi;
     }
 
-    tmp = simd_sum(tmp);
-    if (ntg > N_SIMDWIDTH) {
-        if (sgitg == 0) {
-            buf[tiisg] = 0.0f;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (tiisg == 0) {
-            buf[sgitg] = tmp;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        tmp = buf[tiisg];
-        tmp = simd_sum(tmp);
-    }
+    tmp = helper_reduce_sum(tmp, buf, tpitg, ntg, tiisg, sgitg);
 
     const float variance = tmp / gs;
     const float scale = 1.0f/sqrt(variance + args.eps);
@@ -5888,16 +5758,28 @@ kernel void kernel_timestep_embedding_f32(
     device float * embed_data = (device float *)(dst + i*args.nb1);
 
     int half_ = args.dim / 2;
-    for (int j = tpitg.x; j < half_; j += ntg.x) {
-        float timestep = ((device float *)src0)[i];
-        float freq = (float)exp(-log((float)args.max_period) * j / half_);
-        float arg = timestep * freq;
-        embed_data[j        ] = cos(arg);
-        embed_data[j + half_] = sin(arg);
-    }
 
-    if (args.dim % 2 != 0 && tpitg.x == 0) {
-        embed_data[2 * half_] = 0.f;
+    // Single uniform store per column over the allocated row width (nb1/sizeof(float)),
+    // zero-filling padding lanes. The original scattered two-stores-per-iteration
+    // pattern miscompiled on AMD discrete non-UMA; this pass is reference-equivalent
+    // for every consumed value.
+    const int row_width = (int)(args.nb1 / sizeof(float));
+
+    const float timestep   = ((device const float *) src0)[i];
+    const float log_period = log((float) args.max_period);
+
+    for (int col = tpitg.x; col < row_width; col += ntg.x) {
+        float val;
+        if (col < half_) {
+            const float freq = (float) exp(-log_period * (float) col / (float) half_);
+            val = cos(timestep * freq);
+        } else if (col < 2 * half_) {
+            const float freq = (float) exp(-log_period * (float) (col - half_) / (float) half_);
+            val = sin(timestep * freq);
+        } else {
+            val = 0.0f;
+        }
+        embed_data[col] = val;
     }
 }
 
