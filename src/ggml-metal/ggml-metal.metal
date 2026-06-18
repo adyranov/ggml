@@ -6244,8 +6244,11 @@ kernel void kernel_flash_attn_ext_blk(
             mask_src += args.nb31/2;
         }
 
-        mmin = simd_min(mmin);
-        mmax = simd_max(mmax);
+        // float-cast to avoid a simd_min/simd_max(half) bug on some GPUs, where
+        // reducing with -INF can return -INF instead of the finite extreme.
+        // Numerically identical elsewhere; independent of SIMD width.
+        mmin = half(simd_min(float(mmin)));
+        mmax = half(simd_max(float(mmax)));
 
         if (mmax > -MAXHALF) {
             if (mmin == 0.0 && mmax == 0.0) {
@@ -6539,7 +6542,9 @@ void kernel_flash_attn_ext_impl(
                     smax2 = max(smax2, sm2[j*SH + tiisg]);
                 }
 
-                smax2 = simd_max(smax2);
+                // float-cast to avoid a simd_max(half2) bug on some GPUs;
+                // numerically identical elsewhere.
+                smax2 = half2(simd_max(float2(smax2)));
 
                 if (max(smax2[0], smax2[1]) <= -MAXHALF/2) {
                     // this barrier is important
@@ -7328,7 +7333,10 @@ kernel void kernel_flash_attn_ext_vec(
             }
 
             // skip -INF blocks
-            if (simd_max(sm[tiisg]) <= -MAXHALF) {
+            // NOTE: cast to float to avoid a simd_max(half) miscompile on AMD RDNA
+            // that otherwise skips valid KV blocks (garbage) or, with no mask, all
+            // blocks (S=0 -> Inf).
+            if (simd_max(float(sm[tiisg])) <= -65504.0f) {
                 continue;
             }
 
@@ -7785,6 +7793,361 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 #undef NWG
 #undef DV
 }
+
+// Tiled flash-attention: flat-indexed (threadgroup barriers only, no simdgroup
+// intrinsics), correct on any SIMD width. Tiles K/V into shared memory for reuse.
+// Thread decomposition (TG_SIZE=128): D_SPLIT=16 threads per QK dot, COL_GROUPS=8
+// KV columns in parallel, Bc=32 KV tile; d_tid=tid%D_SPLIT, col_tid=tid/D_SPLIT.
+// dk=dv=64 only (f16/q8_0/q4_0); q4_0 uses ggml's split-nibble layout.
+
+template<typename block_t>
+inline float tiled_load_element_q8_0(device const char * base, uint64_t row_offset, int elem_idx) {
+    device const block_q8_0 * block = (device const block_q8_0 *)(base + row_offset);
+    const int block_idx = elem_idx / 32;
+    const int offset = elem_idx % 32;
+    return float(block[block_idx].qs[offset]) * float(block[block_idx].d);
+}
+
+template<typename block_t>
+inline float tiled_load_element_q4_0(device const char * base, uint64_t row_offset, int elem_idx) {
+    device const block_q4_0 * block = (device const block_q4_0 *)(base + row_offset);
+    const int block_idx = elem_idx / 32;
+    const int offset = elem_idx % 32;
+    device const uint8_t * qs = block[block_idx].qs;
+    // ggml q4_0 is split-nibble: element j (0..15) is the low nibble of qs[j] and
+    // element j+16 is the high nibble of qs[j] (NOT interleaved adjacent nibbles).
+    const int byte_idx = offset & 15;
+    const uint8_t nibble = (offset < 16) ? (qs[byte_idx] & 0x0F) : (qs[byte_idx] >> 4);
+    const float d = float(block[block_idx].d);
+    return (float(nibble) - 8.0f) * d;
+}
+
+template<typename block_t>
+inline float tiled_load_element_f16(device const char * base, uint64_t row_offset, int elem_idx) {
+    device const half * ptr = (device const half *)(base + row_offset);
+    return float(ptr[elem_idx]);
+}
+
+// Sum val across the D_SPLIT threads within the same column group.
+// d_tid is the thread index within its D_SPLIT group; col_tid identifies the
+// group; scratch is TG_SIZE floats of shared memory.
+inline float tiled_shmem_reduce_sum(float val, int d_tid, int col_tid, int D_SPLIT,
+                                    threadgroup float * scratch, uint tid) {
+    scratch[tid] = val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float result = 0.0f;
+    if (d_tid == 0) {
+        const int base_idx = col_tid * D_SPLIT;
+        for (int i = 0; i < D_SPLIT; i++) {
+            result += scratch[base_idx + i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (d_tid == 0) {
+        scratch[col_tid] = result;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    result = scratch[col_tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return result;
+}
+
+template<int DK, int DV, typename kblock_t, typename vblock_t>
+inline void flash_attn_ext_tiled_impl(
+    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
+    device const char * q     [[buffer(1)]],
+    device const char * k     [[buffer(2)]],
+    device const char * v     [[buffer(3)]],
+    device const char * mask  [[buffer(4)]],
+    device       char * dst   [[buffer(5)]],
+    device const char * sinks [[buffer(6)]],
+    constant uint32_t * tg_offset [[buffer(7)]],
+    threadgroup  char * shmem_raw [[threadgroup(0)]],
+    uint3   tgpig    [[threadgroup_position_in_grid]],
+    ushort    tid      [[thread_index_in_threadgroup]])
+{
+    constexpr int TG_SIZE    = 128;
+    constexpr int D_SPLIT    = 16;
+    constexpr int COL_GROUPS = TG_SIZE / D_SPLIT;  // 8
+    constexpr int Bc         = 32;
+    constexpr int COLS_PER_THREAD = Bc / COL_GROUPS;  // 4
+
+    const int d_tid   = tid % D_SPLIT;     // 0..15: which head-dim slice
+    const int col_tid = tid / D_SPLIT;     // 0..7: which column group
+
+    const int iq1 = tgpig.x + tg_offset[0];
+    const int iq2 = tgpig.y;
+    const int iq3 = tgpig.z;
+
+    if (iq1 >= args.ne01) return;
+
+    const int KV = args.ne11;
+
+    const int ik2 = iq2 / (args.ne02 / args.ne_12_2);
+
+    device const float * q_ptr = (device const float *)(q + iq1 * args.nb01 + iq2 * args.nb02 + iq3 * args.nb03);
+
+    device const char * k_head = k + ik2 * args.nb12 + iq3 * args.nb13;
+    device const char * v_head = v + ik2 * args.nb22 + iq3 * args.nb23;
+
+    const bool has_mask = args.ne31 > 0;
+    device const half * mask_row = nullptr;
+    if (has_mask) {
+        mask_row = (device const half *)(mask
+            + iq1 * args.nb31
+            + (iq2 % args.ne32) * args.nb32
+            + (iq3 % args.ne33) * args.nb33);
+    }
+
+    float slope = 1.0f;
+    if (args.max_bias > 0.0f) {
+        const short h = iq2;
+        const float base = h < args.n_head_log2 ? args.m0 : args.m1;
+        const short exph = h < args.n_head_log2 ? h + 1 : 2*(h - args.n_head_log2) + 1;
+        slope = pow(base, float(exph));
+    }
+
+    const bool has_softcap = args.logit_softcap != 0.0f;
+
+    threadgroup float * sh_q       = (threadgroup float *)shmem_raw;
+    threadgroup half  * sh_k       = (threadgroup half  *)(sh_q + DK);
+    threadgroup half  * sh_v       = (threadgroup half  *)(sh_k + Bc * DK);
+    threadgroup float * sh_scores  = (threadgroup float *)(sh_v + Bc * DV);
+    threadgroup float * sh_reduce  = sh_scores + Bc;
+
+    for (int i = tid; i < DK; i += TG_SIZE) {
+        sh_q[i] = q_ptr[i] * args.scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    constexpr int O_PER_THREAD = (DV + D_SPLIT - 1) / D_SPLIT;
+    float o[O_PER_THREAD];
+    for (int j = 0; j < O_PER_THREAD; j++) {
+        o[j] = 0.0f;
+    }
+    float max_score = -__FLT_MAX__ / 2.0f;
+    float sum_exp   = 0.0f;
+
+    for (int tile_start = 0; tile_start < KV; tile_start += Bc) {
+        const int tile_end = min(tile_start + Bc, KV);
+        const int tile_size = tile_end - tile_start;
+
+        const int k_total = tile_size * DK;
+        for (int i = tid; i < k_total; i += TG_SIZE) {
+            const int kv_pos = i / DK;
+            const int d_idx  = i % DK;
+            const int global_kv = tile_start + kv_pos;
+            const uint64_t k_row_offset = (uint64_t)global_kv * args.nb11;
+
+            float val;
+            if (is_same<kblock_t, block_q8_0>::value) {
+                val = tiled_load_element_q8_0<kblock_t>(k_head, k_row_offset, d_idx);
+            } else if (is_same<kblock_t, block_q4_0>::value) {
+                val = tiled_load_element_q4_0<kblock_t>(k_head, k_row_offset, d_idx);
+            } else {
+                val = tiled_load_element_f16<kblock_t>(k_head, k_row_offset, d_idx);
+            }
+            sh_k[kv_pos * DK + d_idx] = half(val);
+        }
+        for (int i = tid; i < Bc * DK; i += TG_SIZE) {
+            const int kv_pos = i / DK;
+            if (kv_pos >= tile_size) {
+                sh_k[i] = half(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int c = 0; c < COLS_PER_THREAD; c++) {
+            const int kv_local = col_tid * COLS_PER_THREAD + c;  // 0..31
+            const int kv_global = tile_start + kv_local;
+
+            float partial_dot = 0.0f;
+            if (kv_local < tile_size) {
+                const int d_start = d_tid * (DK / D_SPLIT);
+                const int d_end   = d_start + (DK / D_SPLIT);
+                for (int d = d_start; d < d_end; d++) {
+                    partial_dot += sh_q[d] * float(sh_k[kv_local * DK + d]);
+                }
+            }
+
+            float score = tiled_shmem_reduce_sum(partial_dot, d_tid, col_tid, D_SPLIT, sh_reduce, tid);
+
+            if (has_softcap) {
+                score = args.logit_softcap * precise::tanh(score);
+            }
+
+            if (has_mask && kv_global < KV) {
+                score += slope * float(mask_row[kv_global]);
+            }
+
+            if (d_tid == 0 && kv_local < tile_size) {
+                sh_scores[kv_local] = score;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int v_total = tile_size * DV;
+        for (int i = tid; i < v_total; i += TG_SIZE) {
+            const int kv_pos = i / DV;
+            const int d_idx  = i % DV;
+            const int global_kv = tile_start + kv_pos;
+            const uint64_t v_row_offset = (uint64_t)global_kv * args.nb21;
+
+            float val;
+            if (is_same<vblock_t, block_q8_0>::value) {
+                val = tiled_load_element_q8_0<vblock_t>(v_head, v_row_offset, d_idx);
+            } else if (is_same<vblock_t, block_q4_0>::value) {
+                val = tiled_load_element_q4_0<vblock_t>(v_head, v_row_offset, d_idx);
+            } else {
+                val = tiled_load_element_f16<vblock_t>(v_head, v_row_offset, d_idx);
+            }
+            sh_v[kv_pos * DV + d_idx] = half(val);
+        }
+        for (int i = tid; i < Bc * DV; i += TG_SIZE) {
+            const int kv_pos = i / DV;
+            if (kv_pos >= tile_size) {
+                sh_v[i] = half(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int c = 0; c < COLS_PER_THREAD; c++) {
+            const int kv_local = col_tid * COLS_PER_THREAD + c;
+            if (kv_local >= tile_size) continue;
+
+            const float score = sh_scores[kv_local];
+
+            float new_max   = max(max_score, score);
+            float factor    = fast::exp(max_score - new_max);
+            float exp_score = fast::exp(score - new_max);
+
+            max_score = new_max;
+            sum_exp   = sum_exp * factor + exp_score;
+
+            const int v_start = d_tid * (DV / D_SPLIT);
+            const int v_end   = v_start + (DV / D_SPLIT);
+            for (int vi = 0; vi < O_PER_THREAD; vi++) {
+                const int v_idx = v_start + vi;
+                if (v_idx < v_end && v_idx < DV) {
+                    o[vi] = o[vi] * factor + exp_score * float(sh_v[kv_local * DV + v_idx]);
+                }
+            }
+        }
+    }
+
+    sh_reduce[tid] = max_score;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_max = -__FLT_MAX__ / 2.0f;
+    for (int g = 0; g < COL_GROUPS; g++) {
+        global_max = max(global_max, sh_reduce[g * D_SPLIT + d_tid]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rescale = fast::exp(max_score - global_max);
+    sum_exp *= rescale;
+    for (int vi = 0; vi < O_PER_THREAD; vi++) {
+        o[vi] *= rescale;
+    }
+
+    sh_reduce[tid] = sum_exp;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_sum_exp = 0.0f;
+    for (int g = 0; g < COL_GROUPS; g++) {
+        global_sum_exp += sh_reduce[g * D_SPLIT + d_tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int v_start = d_tid * (DV / D_SPLIT);
+    for (int vi = 0; vi < O_PER_THREAD; vi++) {
+        const int v_idx = v_start + vi;
+        if (v_idx >= DV) break;
+
+        sh_reduce[tid] = o[vi];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (col_tid == 0) {
+            float total = 0.0f;
+            for (int g = 0; g < COL_GROUPS; g++) {
+                total += sh_reduce[g * D_SPLIT + d_tid];
+            }
+            o[vi] = total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const bool has_sinks = args.ns10 > 0;
+    if (has_sinks && col_tid == 0) {
+        const float s = d_tid == 0 ? ((device const float *) sinks)[iq2] : -__FLT_MAX__ / 2.0f;
+
+        sh_reduce[d_tid] = max(global_max, s);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float sink_val = sh_reduce[0];
+        for (int i = 1; i < D_SPLIT; i++) {
+            sink_val = max(sink_val, sh_reduce[i]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float ms = fast::exp(global_max - sink_val);
+
+        sh_reduce[d_tid] = fast::exp(s - sink_val);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float vs_sum = 0.0f;
+        for (int i = 0; i < D_SPLIT; i++) {
+            vs_sum += sh_reduce[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        global_sum_exp = global_sum_exp * ms + vs_sum;
+        for (int vi = 0; vi < O_PER_THREAD; vi++) {
+            o[vi] *= ms;
+        }
+    }
+
+    if (col_tid == 0) {
+        for (int vi = 0; vi < O_PER_THREAD; vi++) {
+            o[vi] = (global_sum_exp > 0.0f) ? (o[vi] / global_sum_exp) : 0.0f;
+        }
+
+        device float * dst_ptr = (device float *)dst;
+        const int dst_base = iq3 * args.ne2 * args.ne1 * DV
+                           + iq1 * args.ne1 * DV
+                           + iq2 * DV;
+        for (int vi = 0; vi < O_PER_THREAD; vi++) {
+            const int v_idx = v_start + vi;
+            if (v_idx < DV) {
+                dst_ptr[dst_base + v_idx] = o[vi];
+            }
+        }
+    }
+}
+
+#define TILED_KERNEL_WRAPPER(host, dk, dv, ktype, vtype) \
+[[host_name(host)]] \
+kernel void kernel_flash_attn_ext_tiled_##dk##_##dv##_##ktype( \
+    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]], \
+    device const char * q     [[buffer(1)]], \
+    device const char * k     [[buffer(2)]], \
+    device const char * v     [[buffer(3)]], \
+    device const char * mask  [[buffer(4)]], \
+    device       char * dst   [[buffer(5)]], \
+    device const char * sinks [[buffer(6)]], \
+    constant uint32_t * tg_offset [[buffer(7)]], \
+    threadgroup  char * shmem [[threadgroup(0)]], \
+    uint3   tgpig    [[threadgroup_position_in_grid]], \
+    ushort    tid      [[thread_index_in_threadgroup]]) \
+{ \
+    flash_attn_ext_tiled_impl<dk, dv, ktype, vtype>( \
+        args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tid); \
+}
+
+TILED_KERNEL_WRAPPER("kernel_flash_attn_ext_tiled_dk64_dv64",      64, 64, half2,       half2)
+TILED_KERNEL_WRAPPER("kernel_flash_attn_ext_tiled_q8_0_dk64_dv64", 64, 64, block_q8_0,  block_q8_0)
+TILED_KERNEL_WRAPPER("kernel_flash_attn_ext_tiled_q4_0_dk64_dv64", 64, 64, block_q4_0,  block_q4_0)
+
+#undef TILED_KERNEL_WRAPPER
 
 template<typename T0, typename T1>
 kernel void kernel_cpy_t_t(
@@ -11383,6 +11746,303 @@ kernel void kernel_count_equal(
 typedef decltype(kernel_count_equal<int32_t>) kernel_count_equal_t;
 
 template [[host_name("kernel_count_equal_i32")]] kernel kernel_count_equal_t kernel_count_equal<int32_t>;
+
+// Scalar flash-attention for GPUs without simdgroup_mm (adapted from MLX
+// sdpa_vector.h). Needs only simdgroup reduction (simd_sum). Decomposition: BN
+// simdgroups x BD threads, each simdgroup steps KV by BN, each thread handles
+// DK/BD (Q/K) and DV/BD (V) elements, QK dot reduced via simd_sum then cross-
+// simdgroup via shared memory. BD = [[threads_per_simdgroup]] (runtime), BN =
+// threadgroup_size/BD; min SIMD width 8.
+
+template<typename block_t>
+inline float ggml_fa_scalar_load_q8_0(device const char * base, uint64_t row_offset, int elem_idx) {
+    device const block_q8_0 * block = (device const block_q8_0 *)(base + row_offset);
+    const int block_idx = elem_idx / 32;
+    const int offset = elem_idx % 32;
+    return float(block[block_idx].qs[offset]) * float(block[block_idx].d);
+}
+
+template<typename block_t>
+inline float ggml_fa_scalar_load_q4_0(device const char * base, uint64_t row_offset, int elem_idx) {
+    device const block_q4_0 * block = (device const block_q4_0 *)(base + row_offset);
+    const int block_idx = elem_idx / 32;
+    const int offset = elem_idx % 32;
+
+    // ggml q4_0 layout: low nibbles hold elements [0,16), high nibbles hold [16,32)
+    device const uint8_t * qs = block[block_idx].qs;
+    const uint8_t nibble = (offset < 16) ? (qs[offset] & 0x0F) : (qs[offset - 16] >> 4);
+
+    const float d = float(block[block_idx].d);
+    return (float(nibble) - 8.0f) * d;
+}
+
+template<typename block_t>
+inline float ggml_fa_scalar_load_f16(device const char * base, uint64_t row_offset, int elem_idx) {
+    device const half * ptr = (device const half *)(base + row_offset);
+    return float(ptr[elem_idx]);
+}
+
+template<int DK, int DV, typename kblock_t, typename vblock_t>
+inline void ggml_fa_scalar_impl(
+    constant ggml_metal_kargs_flash_attn_ext & args,
+    device const char * q,
+    device const char * k,
+    device const char * v,
+    device const char * mask,
+    device       char * dst,
+    device const char * sinks,
+    constant uint32_t * tg_offset,
+    threadgroup  float * shmem,
+    uint3   tgpig,
+    ushort3 tptg,
+    ushort  simd_gid,
+    ushort  simd_lid,
+    ushort  simd_size)
+{
+    const int BD = (int)simd_size;     // runtime SIMD width (32 on AMD, 8-32 on Intel)
+    const int BN = (int)(tptg.x) / BD; // dynamic: more simdgroups when BD is smaller
+
+    // Compile-time max allocation for smallest supported SIMD width (8)
+    constexpr int max_qk_per_thread = (DK + 7) / 8;
+    constexpr int max_v_per_thread  = (DV + 7) / 8;
+
+    const int qk_per_thread = (DK + BD - 1) / BD;
+    const int v_per_thread  = (DV + BD - 1) / BD;
+
+    const int iq1 = tgpig.x + tg_offset[0]; // query position (with chunk offset)
+    const int iq2 = tgpig.y;                // Q head index
+    const int iq3 = tgpig.z;                // batch index
+
+    if (iq1 >= args.ne01) return;
+
+    const int KV = args.ne11;
+
+    // GQA: map Q head -> K/V head
+    const int ik2 = iq2 / (args.ne02 / args.ne_12_2);
+
+    device const float * q_ptr = (device const float *)(q + iq1 * args.nb01 + iq2 * args.nb02 + iq3 * args.nb03);
+
+    device const char * k_head = k + ik2 * args.nb12 + iq3 * args.nb13;
+    device const char * v_head = v + ik2 * args.nb22 + iq3 * args.nb23;
+
+    const bool has_mask = args.ne31 > 0;
+    device const half * mask_row = nullptr;
+    if (has_mask) {
+        mask_row = (device const half *)(mask
+            + iq1 * args.nb31
+            + (iq2 % args.ne32) * args.nb32
+            + (iq3 % args.ne33) * args.nb33);
+    }
+
+    // ALiBi slope
+    float slope = 1.0f;
+    if (args.max_bias > 0.0f) {
+        const short h = iq2;
+        const float base = h < args.n_head_log2 ? args.m0 : args.m1;
+        const short exph = h < args.n_head_log2 ? h + 1 : 2*(h - args.n_head_log2) + 1;
+        slope = pow(base, float(exph));
+    }
+
+    const bool has_softcap = args.logit_softcap != 0.0f;
+
+    // Load Q into registers (pre-scaled; args.scale already divided by softcap if needed)
+    float q_reg[max_qk_per_thread];
+    for (int j = 0; j < qk_per_thread; j++) {
+        const int q_idx = simd_lid * qk_per_thread + j;
+        q_reg[j] = (q_idx < DK) ? q_ptr[q_idx] * args.scale : 0.0f;
+    }
+
+    float o[max_v_per_thread];
+    for (int j = 0; j < v_per_thread; j++) {
+        o[j] = 0;
+    }
+    float max_score = -__FLT_MAX__ / 2.0f;
+    float sum_exp   = 0;
+
+    // Main KV loop: each simdgroup steps through KV by BN
+    for (int i = simd_gid; i < KV; i += BN) {
+        const uint64_t k_row_offset = (uint64_t)i * args.nb11;
+
+        float score = 0;
+        for (int j = 0; j < qk_per_thread; j++) {
+            const int k_idx = simd_lid * qk_per_thread + j;
+            if (k_idx >= DK) break;
+            float k_val;
+
+            if (is_same<kblock_t, block_q8_0>::value) {
+                k_val = ggml_fa_scalar_load_q8_0<kblock_t>(k_head, k_row_offset, k_idx);
+            } else if (is_same<kblock_t, block_q4_0>::value) {
+                k_val = ggml_fa_scalar_load_q4_0<kblock_t>(k_head, k_row_offset, k_idx);
+            } else {
+                k_val = ggml_fa_scalar_load_f16<kblock_t>(k_head, k_row_offset, k_idx);
+            }
+
+            score += q_reg[j] * k_val;
+        }
+        score = simd_sum(score);
+
+        if (has_softcap) {
+            score = args.logit_softcap * precise::tanh(score);
+        }
+
+        if (has_mask) {
+            score += slope * float(mask_row[i]);
+        }
+
+        // Online softmax update (all lanes share the same score after simd_sum)
+        float new_max   = max(max_score, score);
+        float factor    = fast::exp(max_score - new_max);
+        float exp_score = fast::exp(score - new_max);
+
+        max_score = new_max;
+        sum_exp   = sum_exp * factor + exp_score;
+
+        // Fused V accumulation: O = O * factor + exp_score * V
+        const uint64_t v_row_offset = (uint64_t)i * args.nb21;
+        for (int j = 0; j < v_per_thread; j++) {
+            const int v_idx = simd_lid * v_per_thread + j;
+            if (v_idx >= DV) break;
+            float v_val;
+
+            if (is_same<vblock_t, block_q8_0>::value) {
+                v_val = ggml_fa_scalar_load_q8_0<vblock_t>(v_head, v_row_offset, v_idx);
+            } else if (is_same<vblock_t, block_q4_0>::value) {
+                v_val = ggml_fa_scalar_load_q4_0<vblock_t>(v_head, v_row_offset, v_idx);
+            } else {
+                v_val = ggml_fa_scalar_load_f16<vblock_t>(v_head, v_row_offset, v_idx);
+            }
+
+            o[j] = o[j] * factor + exp_score * v_val;
+        }
+    }
+
+    // --- Cross-simdgroup reduction ---
+    // Shared memory layout: [BN max] [BN sum] [BN*BD output scratch]
+    threadgroup float * sg_max = shmem;
+    threadgroup float * sg_sum = shmem + BN;
+    threadgroup float * sg_out = shmem + 2 * BN;
+
+    if (simd_lid == 0) {
+        sg_max[simd_gid] = max_score;
+        sg_sum[simd_gid] = sum_exp;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_max = sg_max[0];
+    for (int g = 1; g < BN; g++) {
+        global_max = max(global_max, sg_max[g]);
+    }
+
+    float global_sum_exp = 0;
+    for (int g = 0; g < BN; g++) {
+        global_sum_exp += sg_sum[g] * fast::exp(sg_max[g] - global_max);
+    }
+
+    float rescale = fast::exp(max_score - global_max);
+    for (int j = 0; j < v_per_thread; j++) {
+        o[j] *= rescale;
+    }
+
+    for (int j = 0; j < v_per_thread; j++) {
+        const int v_idx = simd_lid * v_per_thread + j;
+        sg_out[simd_gid * BD + simd_lid] = (v_idx < DV) ? o[j] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_gid == 0) {
+            float total = 0;
+            for (int g = 0; g < BN; g++) {
+                total += sg_out[g * BD + simd_lid];
+            }
+            o[j] = total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Attention sinks: fold per-head sink value into the softmax state.
+    // ns10 is repurposed by the host as a has_sinks flag for this kernel.
+    const bool has_sinks = args.ns10 > 0;
+    if (has_sinks && simd_gid == 0) {
+        const float s = simd_lid == 0 ? ((device const float *) sinks)[iq2] : -__FLT_MAX__ / 2.0f;
+        const float sink_val = simd_max(max(global_max, s));
+
+        const float ms = fast::exp(global_max - sink_val);
+        const float vs = fast::exp(s - sink_val);
+
+        global_sum_exp = global_sum_exp * ms + simd_sum(vs);
+
+        for (int j = 0; j < v_per_thread; j++) {
+            o[j] *= ms;
+        }
+    }
+
+    if (simd_gid == 0) {
+        for (int j = 0; j < v_per_thread; j++) {
+            o[j] = (global_sum_exp > 0) ? (o[j] / global_sum_exp) : 0;
+        }
+    }
+
+    // dst layout: [DV, ne1(heads), ne2(N), ne3(batch)] contiguous f32
+    if (simd_gid == 0) {
+        device float * dst_ptr = (device float *)dst;
+        const int dst_base = iq3 * args.ne2 * args.ne1 * DV
+                           + iq1 * args.ne1 * DV
+                           + iq2 * DV;
+        for (int j = 0; j < v_per_thread; j++) {
+            const int v_idx = simd_lid * v_per_thread + j;
+            if (v_idx < DV) {
+                dst_ptr[dst_base + v_idx] = o[j];
+            }
+        }
+    }
+}
+
+#define GGML_FA_SCALAR_KERNEL(NAME, DK, DV, KT, VT)                            \
+kernel void NAME(                                                              \
+    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],             \
+    device const char * q     [[buffer(1)]],                                   \
+    device const char * k     [[buffer(2)]],                                   \
+    device const char * v     [[buffer(3)]],                                   \
+    device const char * mask  [[buffer(4)]],                                   \
+    device       char * dst   [[buffer(5)]],                                   \
+    device const char * sinks [[buffer(6)]],                                   \
+    constant uint32_t * tg_offset [[buffer(7)]],                               \
+    threadgroup  float * shmem [[threadgroup(0)]],                             \
+    uint3   tgpig    [[threadgroup_position_in_grid]],                         \
+    ushort3 tptg     [[threads_per_threadgroup]],                             \
+    ushort  simd_gid [[simdgroup_index_in_threadgroup]],                       \
+    ushort  simd_lid [[thread_index_in_simdgroup]],                           \
+    ushort  simd_size [[threads_per_simdgroup]]) {                             \
+    ggml_fa_scalar_impl<DK, DV, KT, VT>(args, q, k, v, mask, dst, sinks,       \
+        tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);         \
+}
+
+// F16 K/V variants
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk32_dv32,   32,  32,  half2, half2)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk40_dv40,   40,  40,  half2, half2)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk48_dv48,   48,  48,  half2, half2)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk64_dv64,   64,  64,  half2, half2)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk72_dv72,   72,  72,  half2, half2)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk80_dv80,   80,  80,  half2, half2)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk96_dv96,   96,  96,  half2, half2)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk112_dv112, 112, 112, half2, half2)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk128_dv128, 128, 128, half2, half2)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk192_dv192, 192, 192, half2, half2)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk256_dv256, 256, 256, half2, half2)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk576_dv576, 576, 576, half2, half2)
+
+// Non-square head dims (multi-head latent attention: K/query head 576, V head 512)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk576_dv512, 576, 512, half2, half2)
+
+// Q8_0 K/V variants
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_q8_0_dk64_dv64,   64,  64,  block_q8_0, block_q8_0)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_q8_0_dk128_dv128, 128, 128, block_q8_0, block_q8_0)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_q8_0_dk256_dv256, 256, 256, block_q8_0, block_q8_0)
+
+// Q4_0 K/V variants
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_q4_0_dk64_dv64,   64,  64,  block_q4_0, block_q4_0)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_q4_0_dk128_dv128, 128, 128, block_q4_0, block_q4_0)
+GGML_FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_q4_0_dk256_dv256, 256, 256, block_q4_0, block_q4_0)
+
 // Tiled matmul for GPUs without simdgroup_mm: shared-memory GEMM, flat thread
 // indices, no simdgroup intrinsics (any SIMD width). Keeps a BMxBN output tile
 // in shared memory, reduces over K in BK chunks. Avoids the per-column mul_mv
